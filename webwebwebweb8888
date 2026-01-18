@@ -1,0 +1,516 @@
+/******************************************************************************************
+ * ⚡ GENIUS BOT — ZEN EDITION (STABILITY FIX)
+ * ----------------------------------------------------------------------------------------
+ * 1. FIXED: Phemex API Error 30000 (Added 'since' timestamp to OHLCV).
+ * 2. ROBUST: Granular Error Handling in Sync.
+ * 3. SAFETY: Stop Loss @ -35% ROI.
+ ******************************************************************************************/
+
+require('dotenv').config();
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const ccxt = require('ccxt');
+const minimist = require('minimist');
+
+// ================= ARGUMENTS & SETUP =================
+const args = minimist(process.argv.slice(2));
+const COIN = args.coin?.toUpperCase() || 'LUNC'; 
+const PORT = parseInt(args.port) || 3000;
+
+// ================= CONFIGURATION =================
+const CONFIG = {
+    // SYMBOLS
+    PRICE_SYMBOL: `${COIN}/USDT`, 
+    ORDER_SYMBOL: `${COIN}/USDT:USDT`,
+
+    // TIMING
+    TIMEFRAME: '1m',          
+    BIAS_TIMEFRAME: '1h',     
+    POLL_RATE: 3000,          // Relaxed slightly for stability
+    
+    // GRID SETTINGS
+    GRID_LEVELS: 10,          
+    FIXED_GRID_STEP_PCT: 0.0005, 
+    PROFIT_MARGIN_PCT: 0.20,  
+    
+    // MARTINGALE
+    MARTINGALE_MULTIPLIER: 1.5, 
+    MAX_QTY_CAP: 2,           
+    
+    // RISK MANAGEMENT
+    LEVERAGE: 50,             
+    STOP_LOSS_ROI: -35,       
+    
+    // SCALING (Contracts per 1 USD)
+    QTY_SCALING: 1000         
+};
+
+// ================= STATE =================
+const state = {
+    market: { price: 0, bid: 0, ask: 0 },
+    wallet: { balance: 0, available: 0 },
+    indicators: { bias: 'NEUTRAL' },
+    position: { qty: 0, entry: 0, side: null, unrealizedPnl: 0, roi: 0 },
+    openOrders: [],
+    status: 'BOOTING...',
+    isBusy: false
+};
+
+// ================= EXCHANGE =================
+const exchange = new ccxt.phemex({
+    apiKey: process.env.PHEMEX_KEY,
+    secret: process.env.PHEMEX_SECRET,
+    options: { defaultType: 'swap' }
+});
+
+// ================= HELPERS =================
+const TA = {
+    ema: (data, period) => {
+        if(data.length < period) return data[data.length-1];
+        const k = 2/(period+1);
+        let ema=data[0];
+        for(let i=1;i<data.length;i++) ema=data[i]*k + ema*(1-k);
+        return ema;
+    }
+};
+
+// ================= INIT =================
+async function initialize() {
+    try {
+        console.log("🔌 Connecting to Phemex...");
+        await exchange.loadMarkets();
+        
+        const markets = Object.values(exchange.markets);
+        const swapMarket = markets.find(m => 
+            (m.base === COIN || m.id.includes(COIN)) && 
+            m.linear === true && 
+            m.quote === 'USDT'
+        );
+
+        if (swapMarket) {
+            console.log(`✅ Zen Bot Initialized: ${swapMarket.symbol}`);
+            CONFIG.PRICE_SYMBOL = swapMarket.symbol;
+            CONFIG.ORDER_SYMBOL = swapMarket.symbol;
+        } else {
+            throw new Error(`Could not find Linear Swap for ${COIN}`);
+        }
+
+        try { 
+            await exchange.setLeverage(CONFIG.LEVERAGE, CONFIG.ORDER_SYMBOL); 
+        } catch (e) {
+            console.log(`⚠️ Leverage Set Warning: ${e.message}`);
+        }
+
+    } catch (e) {
+        console.error("❌ STARTUP FAILED:", e.message);
+        process.exit(1);
+    }
+}
+
+// ================= DATA SYNC (ROBUST) =================
+async function sync() {
+    const sym = CONFIG.ORDER_SYMBOL;
+    
+    // 1. TICKER
+    try {
+        const ticker = await exchange.fetchTicker(sym);
+        state.market.price = ticker.last;
+        state.market.bid = ticker.bid || ticker.last;
+        state.market.ask = ticker.ask || ticker.last;
+    } catch (e) { 
+        console.error(`[SYNC] Ticker Error: ${e.message}`); 
+        state.status = "API ERROR (TICKER)";
+        return; // Critical failure
+    }
+
+    // 2. OHLCV (Bias) - FIXED 30000 ERROR
+    try {
+        const limit = 50;
+        // Phemex REQUIRES a valid 'since' timestamp to calculate 'from'
+        const since = Date.now() - (limit * 60 * 60 * 1000 * 1.5); // 1.5x buffer
+        
+        const ohlc1h = await exchange.fetchOHLCV(sym, CONFIG.BIAS_TIMEFRAME, since, limit);
+        if (ohlc1h.length > 0) {
+            const close1h = ohlc1h.map(c => c[4]);
+            const ema1h = TA.ema(close1h, 50);
+            state.indicators.bias = close1h[close1h.length-1] > ema1h ? 'BULLISH' : 'BEARISH';
+        }
+    } catch (e) { 
+        // Non-critical, just log
+        // console.error(`[SYNC] OHLCV Warning: ${e.message}`); 
+    }
+
+    // 3. BALANCE
+    try {
+        const bal = await exchange.fetchBalance();
+        state.wallet.balance = bal.USDT?.total || bal.total?.USDT || 0;
+    } catch (e) { console.error(`[SYNC] Balance Error: ${e.message}`); }
+
+    // 4. POSITION
+    try {
+        // Fetch ALL positions and find ours (Safest method for Phemex)
+        const rawPositions = await exchange.fetchPositions(); 
+        const activePos = rawPositions.find(p => p.symbol === sym) || {};
+        
+        const qty = parseFloat(activePos.contracts) || 0;
+        const entry = parseFloat(activePos.entryPrice) || (parseFloat(activePos.info?.avgEntryPrice || 0));
+        
+        let roi = 0;
+        if(qty > 0 && entry > 0) {
+            const diff = state.market.price - entry;
+            const dir = activePos.side === 'long' ? 1 : -1;
+            roi = (diff / entry) * CONFIG.LEVERAGE * 100 * dir;
+        }
+
+        state.position = { 
+            qty, 
+            entry, 
+            side: activePos.side === 'long' ? 'LONG' : (activePos.side === 'short' ? 'SHORT' : null), 
+            unrealizedPnl: parseFloat(activePos.unrealizedPnl)||0,
+            roi 
+        };
+    } catch (e) { console.error(`[SYNC] Position Error: ${e.message}`); }
+
+    // 5. ORDERS
+    try {
+        state.openOrders = await exchange.fetchOpenOrders(sym);
+    } catch (e) { console.error(`[SYNC] Orders Error: ${e.message}`); }
+}
+
+// ================= GRID MANAGER =================
+async function manageGrid(io) {
+    if (state.isBusy) return;
+    state.isBusy = true;
+    
+    await sync();
+
+    if (!state.market.price || state.market.price <= 0) {
+        state.isBusy = false;
+        io.emit('stats', formatData());
+        return;
+    }
+
+    const p = state.position;
+    const sym = CONFIG.ORDER_SYMBOL;
+
+    // 🛑 1. STOP LOSS CHECK
+    if (p.qty > 0 && p.roi <= CONFIG.STOP_LOSS_ROI) {
+        console.log(`🚨 STOP LOSS TRIGGERED: ROI ${p.roi.toFixed(2)}%`);
+        state.status = "🛑 EXECUTING STOP LOSS";
+        io.emit('stats', formatData());
+
+        try {
+            await exchange.cancelAllOrders(sym);
+            const closeSide = p.side === 'LONG' ? 'sell' : 'buy';
+            await exchange.createOrder(sym, 'market', closeSide, p.qty, undefined, {'reduceOnly': true});
+            await new Promise(r => setTimeout(r, 5000));
+            state.isBusy = false;
+            return;
+        } catch (e) {
+            console.error("❌ STOP LOSS FAILED:", e.message);
+            state.isBusy = false;
+            return; 
+        }
+    }
+
+    // --- 2. ENTRY LOGIC ---
+    if (p.qty === 0) {
+        if (state.openOrders.length > 0) {
+            state.status = "PURGING...";
+            try { await exchange.cancelAllOrders(sym); } catch {}
+            state.isBusy = false;
+            return;
+        }
+
+        let dynamicBaseQty = Math.floor(state.wallet.balance * CONFIG.QTY_SCALING);
+        if (dynamicBaseQty < 1) dynamicBaseQty = 1;
+
+        state.status = `AWAITING ENTRY (${state.indicators.bias})`;
+        const isBullish = state.indicators.bias === 'BULLISH';
+        const side = isBullish ? 'buy' : 'sell';
+        
+        try {
+            await exchange.createOrder(sym, 'market', side, dynamicBaseQty);
+            await new Promise(r => setTimeout(r, 1000));
+        } catch (e) {}
+    } 
+    
+    // --- 3. GRID MANAGEMENT ---
+    else if (p.qty > 0) {
+        state.status = "⚔️ DEFENDING GRID";
+        const isLong = p.side === 'LONG';
+        const safetySide = isLong ? 'buy' : 'sell';
+        const baseQty = Math.max(1, Math.floor(p.qty / 2)); 
+        const gridSpacing = p.entry * CONFIG.FIXED_GRID_STEP_PCT;
+
+        // A. IDEAL LEVELS
+        const idealLevels = [];
+        const usedPrices = new Set();
+        
+        for (let i = 1; i <= CONFIG.GRID_LEVELS; i++) {
+            let qty = Math.floor(baseQty * Math.pow(CONFIG.MARTINGALE_MULTIPLIER, i));
+            const amountStr = exchange.amountToPrecision(sym, qty);
+            qty = parseFloat(amountStr);
+            if (qty < 1) continue;
+            const maxAllowed = baseQty * CONFIG.MAX_QTY_CAP;
+            if (qty > maxAllowed) qty = maxAllowed;
+            
+            let targetPrice;
+            if (isLong) {
+                targetPrice = p.entry - (gridSpacing * i);
+                if (targetPrice > state.market.bid) targetPrice = state.market.bid * 0.9998;
+            } else {
+                targetPrice = p.entry + (gridSpacing * i);
+                if (targetPrice < state.market.ask) targetPrice = state.market.ask * 1.0002;
+            }
+            
+            if (targetPrice <= 0) continue;
+            const priceString = exchange.priceToPrecision(sym, targetPrice);
+            
+            if (!usedPrices.has(priceString)) {
+                idealLevels.push({ 
+                    level: i, 
+                    side: safetySide, 
+                    qty: qty, 
+                    price: parseFloat(priceString),
+                    priceString: priceString 
+                });
+                usedPrices.add(priceString);
+            }
+        }
+
+        // B. AUDIT
+        const safetyOrders = state.openOrders.filter(o => o.side === safetySide);
+        const keptOrderIds = new Set();
+        const missingLevels = [];
+
+        for (const ideal of idealLevels) {
+            const match = safetyOrders.find(o => {
+                if (keptOrderIds.has(o.id)) return false;
+                const currentAmt = parseFloat(o.amount);
+                const currentPxStr = exchange.priceToPrecision(sym, o.price);
+                return Math.abs(currentAmt - ideal.qty) <= 1 && currentPxStr === ideal.priceString;
+            });
+            if (match) keptOrderIds.add(match.id); 
+            else missingLevels.push(ideal); 
+        }
+
+        const trashOrders = safetyOrders.filter(o => !keptOrderIds.has(o.id));
+        if (trashOrders.length > 0) {
+            await Promise.all(trashOrders.map(o => exchange.cancelOrder(o.id, sym).catch(e=>{})));
+        }
+
+        if (missingLevels.length > 0) {
+            for (const ideal of missingLevels) {
+                try {
+                    await exchange.createOrder(sym, 'limit', ideal.side, ideal.qty, ideal.price, {'timeInForce': 'PostOnly'});
+                    await new Promise(r => setTimeout(r, 50)); 
+                } catch(e) {
+                    if(e.message.includes('PostOnly')) {
+                        try { await exchange.createOrder(sym, 'limit', ideal.side, ideal.qty, ideal.price); } catch {}
+                    }
+                }
+            }
+        }
+
+        // C. TAKE PROFIT
+        const tpSide = isLong ? 'sell' : 'buy';
+        const tpOrders = state.openOrders.filter(o => o.side === tpSide);
+        const profitMargin = p.entry * (CONFIG.PROFIT_MARGIN_PCT / 100);
+        
+        let idealTpPrice;
+        if (isLong) idealTpPrice = Math.max(p.entry + profitMargin, state.market.ask * 1.0005);
+        else idealTpPrice = Math.min(p.entry - profitMargin, state.market.bid * 0.9995);
+        
+        const tpString = exchange.priceToPrecision(sym, idealTpPrice);
+        const tpFloat = parseFloat(tpString);
+
+        if (tpOrders.length === 0) {
+            await placeOrder(tpSide, p.qty, tpFloat, true);
+        } 
+        else {
+            const tpOrder = tpOrders[0];
+            const currentTpStr = exchange.priceToPrecision(sym, tpOrder.price);
+            const currentTpQty = parseFloat(tpOrder.amount);
+            const priceDiff = Math.abs(parseFloat(currentTpStr) - tpFloat);
+            const qtyDiff = Math.abs(currentTpQty - p.qty);
+
+            if (currentTpStr !== tpString || qtyDiff > 1) {
+                const pctDiff = (priceDiff / tpFloat) * 100;
+                if (pctDiff > 0.02 || qtyDiff > 1) {
+                    try {
+                        await exchange.cancelOrder(tpOrder.id, sym);
+                        await placeOrder(tpSide, p.qty, tpFloat, true);
+                    } catch(e) {}
+                }
+            }
+        }
+    }
+
+    io.emit('stats', formatData());
+    state.isBusy = false;
+}
+
+async function placeOrder(side, qty, price, reduceOnly = false) {
+    const params = {};
+    if (reduceOnly) params['reduceOnly'] = true;
+    else params['timeInForce'] = 'PostOnly';
+    
+    try {
+        await exchange.createOrder(CONFIG.ORDER_SYMBOL, 'limit', side, qty, price, params);
+    } catch(e) {}
+}
+
+function formatData() {
+    return {
+        price: state.market.price,
+        bias: state.indicators.bias,
+        pos: state.position,
+        bal: state.wallet.balance,
+        orders: state.openOrders.length,
+        status: state.status,
+        coin: COIN
+    };
+}
+
+// ================= SERVER =================
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+app.get('/', (_, res) => res.send(DASHBOARD_HTML));
+
+initialize().then(() => {
+    server.listen(PORT, () => {
+        console.log(`\n🤖 ZEN BOT (FIXED) ACTIVE [${COIN}]`);
+        console.log(`👉 Dashboard: http://localhost:${PORT}\n`);
+        setInterval(() => manageGrid(io), CONFIG.POLL_RATE);
+    });
+});
+
+// ================= UI DASHBOARD =================
+const DASHBOARD_HTML = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ZEN BOT DASHBOARD</title>
+<script src="https://cdn.jsdelivr.net/npm/socket.io-client@4/dist/socket.io.min.js"></script>
+<style>
+:root{--bg:#050505;--card:#111;--text:#888;--text-hi:#eee;--green:#0fdb84;--red:#f23a57;--blue:#2874f0;}
+body{margin:0;background:var(--bg);font-family:'Courier New', monospace;color:var(--text);padding:20px;display:flex;justify-content:center;}
+.container{max-width:600px;width:100%;}
+h1{color:var(--text-hi);font-size:18px;margin-bottom:20px;border-bottom:1px solid #222;padding-bottom:10px;display:flex;justify-content:space-between;}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+.card{background:var(--card);padding:15px;border-radius:4px;border:1px solid #222;}
+.label{font-size:10px;letter-spacing:1px;margin-bottom:5px;}
+.val{font-size:18px;color:var(--text-hi);font-weight:bold;}
+.lg{font-size:24px;}
+.status-bar{margin-top:20px;background:#090909;padding:12px;text-align:center;border:1px solid #222;color:var(--blue);font-weight:bold;font-size:14px;border-radius:4px;}
+.pnl-pos{color:var(--green);}
+.pnl-neg{color:var(--red);}
+.tag{font-size:10px;padding:2px 6px;border-radius:3px;vertical-align:middle;}
+.tag-long{background:rgba(15,219,132,0.2);color:var(--green);}
+.tag-short{background:rgba(242,58,87,0.2);color:var(--red);}
+</style>
+</head>
+<body>
+<div class="container">
+    <h1>
+        <span>ZEN BOT <span style="color:#444">///</span> <span id="coin">---</span></span>
+        <span id="bias" style="font-size:12px;padding-top:4px;">NEUTRAL</span>
+    </h1>
+    
+    <div class="card" style="margin-bottom:10px; border-left: 4px solid var(--blue);">
+        <div class="label">CURRENT PRICE</div>
+        <div class="val lg" id="price">0.0000</div>
+    </div>
+
+    <div class="grid">
+        <div class="card">
+            <div class="label">WALLET BALANCE</div>
+            <div class="val" id="bal">---</div>
+        </div>
+        <div class="card">
+            <div class="label">OPEN ORDERS</div>
+            <div class="val" id="orders">0</div>
+        </div>
+    </div>
+
+    <div class="card" style="margin-top:10px;">
+        <div class="label" style="display:flex;justify-content:space-between;">
+            <span>ACTIVE POSITION</span>
+            <span id="side">---</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-top:10px;">
+            <div>
+                <div class="label">SIZE</div>
+                <div class="val" id="qty">0</div>
+            </div>
+            <div style="text-align:right;">
+                <div class="label">ENTRY</div>
+                <div class="val" id="entry">0.0000</div>
+            </div>
+        </div>
+        <div style="margin-top:15px;padding-top:10px;border-top:1px dashed #333;display:flex;justify-content:space-between;">
+            <div>
+                <div class="label">ROI %</div>
+                <div class="val" id="roi">0.00%</div>
+            </div>
+            <div style="text-align:right;">
+                <div class="label">PnL (USDT)</div>
+                <div class="val" id="pnl">0.00</div>
+            </div>
+        </div>
+    </div>
+
+    <div id="status" class="status-bar">CONNECTING...</div>
+</div>
+
+<script>
+const socket = io();
+socket.on('stats', d => {
+    document.getElementById('coin').innerText = d.coin;
+    document.getElementById('status').innerText = d.status;
+    document.getElementById('price').innerText = d.price;
+    document.getElementById('bal').innerText = '$' + d.bal.toFixed(2);
+    document.getElementById('orders').innerText = d.orders;
+    document.getElementById('bias').innerText = 'BIAS: ' + d.bias;
+    document.getElementById('bias').style.color = d.bias === 'BULLISH' ? '#0fdb84' : (d.bias === 'BEARISH' ? '#f23a57' : '#888');
+
+    const p = d.pos;
+    const sideEl = document.getElementById('side');
+    if (p.qty > 0) {
+        sideEl.innerText = p.side;
+        sideEl.className = 'tag ' + (p.side === 'LONG' ? 'tag-long' : 'tag-short');
+    } else {
+        sideEl.innerText = 'IDLE';
+        sideEl.className = 'tag';
+    }
+
+    document.getElementById('qty').innerText = p.qty;
+    document.getElementById('entry').innerText = p.entry > 0 ? p.entry : '---';
+    
+    const pnlEl = document.getElementById('pnl');
+    pnlEl.innerText = (p.unrealizedPnl > 0 ? '+' : '') + p.unrealizedPnl.toFixed(4);
+    pnlEl.className = 'val ' + (p.unrealizedPnl >= 0 ? 'pnl-pos' : 'pnl-neg');
+
+    const roiEl = document.getElementById('roi');
+    roiEl.innerText = (p.roi > 0 ? '+' : '') + p.roi.toFixed(2) + '%';
+    roiEl.className = 'val ' + (p.roi >= 0 ? 'pnl-pos' : 'pnl-neg');
+    
+    const statusEl = document.getElementById('status');
+    if(d.status.includes('STOP LOSS')) {
+        statusEl.style.color = '#f23a57';
+        statusEl.style.borderColor = '#f23a57';
+    } else {
+        statusEl.style.color = '#2874f0';
+        statusEl.style.borderColor = '#222';
+    }
+});
+</script>
+</body>
+</html>
+`;
