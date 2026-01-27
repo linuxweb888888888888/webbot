@@ -1,0 +1,46 @@
+#service apache2 start
+
+#while true
+#do
+
+cd /app/
+
+#node /headless.js --coin="$coin" --strategy="$strategy" --usdt=0.001 --multiplier="$multiplier" --tp="0.1" --single="$single" --key="-3Mn7DL8P20iTj7QPoOSgyATuDcF-87h" --secret="WzxCckLuICMXcjdRL-CbgcsbpGXHePcs" --mode="$mode"
+
+#node ./signal.js --coin="$coin" --quantity="$quantity" --port="3000" &> /dev/null &
+
+#for linux8888 in $(cat /coincoin8888)
+#do
+
+node ./bot.js --coin="BLESS 1000WHY 1000SATS LUNC B0B NEIRO HMSTR SPELL BOME 1000000BABYDOGE CAMP B3 MEW MEME DEGEN FHE EPT IOST TLM RSR CKB 1000CAT PEAQ SOMI SXT BEAM GIGA ADA ONE BROCCOLI BICO ANKR YGG GALA USELESS RVN JASMY ANIME TWT MAGIC T PEOPLE AVAAI ATH ZIL ONT SKL CELO VET ACH ALGO F XVG IOTX 1000SHIB" --port="3000" &> /dev/null &
+
+#done
+
+#i=0
+#while read -r linux8888; do
+#  if (( i % 2 == 0 )); then
+#    position="short"
+#  else
+#    position="long"
+#  fi
+
+#  node ./signal.js \
+#    --coin="$linux8888" \
+#    --quantity="1" \
+#    --position="$position" \
+#    --port="$(shuf -i8080-9800 -n1)" \
+#    &> /dev/null &
+
+#  ((i++))
+#done < /coincoin8888
+
+#sleep 10
+
+#done
+
+while true
+do
+
+sleep 10
+
+done
