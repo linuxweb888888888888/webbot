@@ -1,0 +1,508 @@
+/******************************************************************************************
+
+    💎 USDT STRATEGY BOT — LIQUIDATION PERCENTAGE MONITOR (FULL VERSION)
+    
+    usage: node bot.js --coin="ZEC BTC ETH SOL" --port=3000
+
+    LOGIC:
+    1. Coin 1 (Even) = SHORT
+    2. Coin 2 (Odd)  = LONG
+    3. ENTRY: Minimum Exchange Qty * Multiplier
+    4. DEFENSE: Adds funds when Liquidation Risk hits 80% (Calculated via Margin Ratio)
+    
+******************************************************************************************/
+
+require('dotenv').config();
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const ccxt = require('ccxt');
+const minimist = require('minimist');
+
+// ================= CONFIGURATION =================
+const args = minimist(process.argv.slice(2));
+
+// Parse Coins
+const rawCoinArg = args.coin || 'BTC ETH SOL';
+const COIN_LIST = rawCoinArg.toString().split(/[\s,]+/).filter(c => c).map(c => c.toUpperCase());
+const PORT = parseInt(args.port) || 3000;
+
+const CONFIG = {
+    // 🎯 TARGETS
+    TAKE_PROFIT_ROI: 6,          // Close position at +6% ROI
+
+    // 🛡️ DEFENSE SETTINGS
+    LIQ_RISK_TRIGGER: 15,        // Add funds when risk is 80% (0% = Safe, 100% = Rekt)
+    
+    TARGET_RECOVERY_ROI: 35,     // When defending, aim for this new average entry ROI
+    LEVERAGE: 10,               
+    
+    // ⚡ ENTRY SETTINGS
+    ENTRY_MULTIPLIER: 10,        // Multiplies the Min Qty (e.g., 0.001 * 10 = 0.01)
+    
+    // ⏳ TIME SETTINGS
+    POLL_RATE: 98000              // Poll every 4 seconds
+};
+
+// ================= STATE =================
+const state = {
+    wallet: { balance: 0 },
+    coins: {} 
+};
+
+// Initialize State
+COIN_LIST.forEach(coin => {
+    state.coins[coin] = {
+        symbol: `${coin}/USDT:USDT`,
+        market: { price: 0, markPrice: 0, trend: 'NEUTRAL' },
+        position: { qty: 0, entry: 0, liqPrice: 0, upnl: 0, roi: 0, margin: 0, side: 'NONE', leverage: 0, risk: 0 },
+        bot: { status: 'BOOTING', recoveryQty: 0 }
+    };
+});
+
+// Initialize Exchange
+const exchange = new ccxt.phemex({
+    apiKey: process.env.PHEMEX_KEY,
+    secret: process.env.PHEMEX_SECRET,
+    options: { defaultType: 'swap' }
+});
+
+// ================= 🧠 MATH ENGINE (ACCURATE MARGIN CALC) =================
+
+/**
+ * Calculates Liquidation Risk based on Maintenance Margin Ratio.
+ * Risk = (Maintenance Margin Required / Current Margin Balance) * 100
+ */
+function calculateLiqRisk(side, entry, mark, qty, leverage, mmr = 0.005) {
+    // Safety check for empty positions
+    if (!qty || qty <= 0 || !entry || entry <= 0 || !mark || mark <= 0) return 0;
+
+    // 1. Calculate Position Value at Mark Price
+    const positionValue = qty * mark;
+
+    // 2. Calculate Maintenance Margin (Minimum equity needed to avoid liquidation)
+    // Default MMR 0.005 (0.5%) is standard for major coins < 20x leverage
+    const maintenanceMargin = positionValue * mmr;
+
+    // 3. Calculate Initial Margin (What was put down)
+    const initialMargin = (qty * entry) / leverage;
+
+    // 4. Calculate Unrealized PnL
+    let upnl = 0;
+    if (side === 'long') {
+        upnl = (mark - entry) * qty;
+    } else if (side === 'short') {
+        upnl = (entry - mark) * qty;
+    }
+
+    // 5. Calculate Margin Balance (Initial Margin + Unrealized PnL)
+    const marginBalance = initialMargin + upnl;
+
+    // 🚨 If Balance <= Maintenance, Risk is 100% (Liquidated)
+    if (marginBalance <= maintenanceMargin) return 100.00;
+
+    // 6. Calculate Risk Percentage
+    // Formula: (Maintenance / Balance) * 100
+    const risk = (maintenanceMargin / marginBalance) * 100;
+
+    return Math.max(0, risk); 
+}
+
+function calculateRecoveryQty(side, currentPrice, currentEntry, currentQty, targetRoi, leverage) {
+    const roiDecimal = targetRoi / 100;
+    let targetAvgEntry;
+
+    if (side === 'long') {
+        targetAvgEntry = currentPrice / ((roiDecimal / leverage) + 1);
+    } else {
+        targetAvgEntry = currentPrice / (1 - (roiDecimal / leverage));
+    }
+
+    const numerator = currentQty * (currentEntry - targetAvgEntry);
+    const denominator = targetAvgEntry - currentPrice;
+
+    if (Math.abs(denominator) === 0) return 0;
+    return Math.abs(numerator / denominator);
+}
+
+// =================  CORE LOOP =================
+
+async function run() {
+    try {
+        // 0. GLOBAL INIT
+        if (!exchange.markets) await exchange.loadMarkets();
+        
+        try {
+            const balance = await exchange.fetchBalance();
+            state.wallet.balance = balance.USDT?.total || 0;
+        } catch(e) { /* Ignore balance errors */ }
+
+        const allPositions = await exchange.fetchPositions();
+
+        for (const coin of COIN_LIST) {
+            const coinState = state.coins[coin];
+            const SYMBOL = coinState.symbol;
+            const coinIndex = COIN_LIST.indexOf(coin);
+
+            try {
+                // A. GET COIN LIMITS
+                const marketInfo = exchange.market(SYMBOL);
+                const limitMin = marketInfo.limits?.amount?.min;
+                const marketMin = marketInfo.limits?.market?.min;
+                const precisionMin = marketInfo.precision?.amount;
+                const minQtyLimit = limitMin || marketMin || precisionMin || 0.0001;
+
+                // B. UPDATE MARKET DATA
+                const ticker = await exchange.fetchTicker(SYMBOL);
+                coinState.market.price = ticker.last;
+                coinState.market.markPrice = ticker.info.markPrice ? parseFloat(ticker.info.markPrice) : ticker.last;
+
+                // C. UPDATE POSITION DATA
+                const pos = allPositions.find(p => p.symbol === SYMBOL) || {};
+                coinState.position.qty = Math.abs(parseFloat(pos.contracts)) || 0;
+                coinState.position.entry = parseFloat(pos.entryPrice) || 0;
+                coinState.position.upnl = parseFloat(pos.unrealizedPnl) || 0;
+                coinState.position.leverage = pos.leverage ? parseFloat(pos.leverage) : 0;
+                coinState.position.liqPrice = pos.liquidationPrice ? parseFloat(pos.liquidationPrice) : 0;
+
+                let rawSide = pos.side ? pos.side.toLowerCase() : 'none';
+                if (rawSide === 'buy') rawSide = 'long';
+                if (rawSide === 'sell') rawSide = 'short';
+                coinState.position.side = rawSide;
+
+                if (coinState.position.qty > 0 && coinState.position.entry > 0) {
+                    const positionValue = coinState.position.qty * coinState.position.entry;
+                    coinState.position.margin = positionValue / CONFIG.LEVERAGE;
+                    coinState.position.roi = coinState.position.margin !== 0 ? (coinState.position.upnl / coinState.position.margin) * 100 : 0;
+                    
+                    // ⚠️ CALCULATE LIQUIDATION RISK (ACCURATE MARGIN METHOD) ⚠️
+                    coinState.position.risk = calculateLiqRisk(
+                        coinState.position.side,
+                        coinState.position.entry,
+                        coinState.market.markPrice,
+                        coinState.position.qty,
+                        CONFIG.LEVERAGE, // Force Config Leverage to see "Theoretical" risk if leverage is adjusting
+                        0.005            // Standard MMR 0.5%
+                    );
+                } else {
+                    coinState.position.roi = 0;
+                    coinState.position.margin = 0;
+                    coinState.position.risk = 0;
+                }
+
+                // D. ENFORCE LEVERAGE
+                if (coinState.position.leverage !== CONFIG.LEVERAGE) {
+                    try {
+                        console.log(`[${coin}] LEVERAGE MISMATCH: ${coinState.position.leverage}x -> ${CONFIG.LEVERAGE}x. Adjusting...`);
+                        await exchange.setLeverage(CONFIG.LEVERAGE, SYMBOL);
+                    } catch(e) {
+                        console.error(`[${coin}] Leverage Error:`, e.message);
+                    }
+                }
+
+                coinState.market.trend = (coinIndex % 2 === 0) ? 'SHORT' : 'LONG';
+
+                // F. STRATEGY EXECUTION
+
+                // --- 1. ENTRY ---
+                if (coinState.position.qty === 0) {
+                    
+                    // Take Minimum Quantity * Multiplier
+                    let rawQty = minQtyLimit * CONFIG.ENTRY_MULTIPLIER;
+                    
+                    let calculatedQty = parseFloat(exchange.amountToPrecision(SYMBOL, rawQty));
+                    if (calculatedQty < minQtyLimit) calculatedQty = minQtyLimit;
+
+                    // Odd/Even Logic
+                    const orderSide = (coinIndex % 2 === 0) ? 'sell' : 'buy'; 
+                    const logMsg = orderSide === 'sell' ? '📉 Even->SHORT' : '📈 Odd->LONG';
+                    coinState.bot.status = `ENTRY: ${logMsg}`;
+                    coinState.bot.recoveryQty = 0;
+
+                    try {
+                        console.log(`[${coin}] ENTRY ${logMsg} | MinQty: ${minQtyLimit} | Multiplier: ${CONFIG.ENTRY_MULTIPLIER} | Order: ${calculatedQty}`);
+                        await exchange.createOrder(SYMBOL, 'market', orderSide, calculatedQty);
+                        await new Promise(r => setTimeout(r, 1000));
+                    } catch (e) {
+                        console.error(`[${coin}] Entry Error:`, e.message);
+                        coinState.bot.status = "ENTRY FAILED";
+                    }
+                }
+                // --- 2. MANAGE ---
+                else {
+                    const isLong = coinState.position.side === 'long';
+
+                    // TAKE PROFIT
+                    if (coinState.position.roi >= CONFIG.TAKE_PROFIT_ROI) {
+                        coinState.bot.status = `💰 TP HIT (${coinState.position.roi.toFixed(2)}%)`;
+                        console.log(`[${coin}] WIN ${coinState.position.roi.toFixed(2)}%`);
+                        try {
+                            const closeSide = isLong ? 'sell' : 'buy';
+                            await exchange.createOrder(SYMBOL, 'market', closeSide, coinState.position.qty, undefined, { 'reduceOnly': true });
+                            await new Promise(r => setTimeout(r, 1000));
+                            continue; 
+                        } catch(e) { console.error(`[${coin}] TP Error:`, e.message); }
+                    }
+
+                    // RECOVERY CALC
+                    let rawNeeded = calculateRecoveryQty(
+                        coinState.position.side,
+                        coinState.market.markPrice,
+                        coinState.position.entry,
+                        coinState.position.qty,
+                        CONFIG.TARGET_RECOVERY_ROI,
+                        CONFIG.LEVERAGE
+                    );
+                    
+                    if (rawNeeded < minQtyLimit) rawNeeded = minQtyLimit;
+                    let finalDefendQty = parseFloat(exchange.amountToPrecision(SYMBOL, rawNeeded));
+                    coinState.bot.recoveryQty = finalDefendQty;
+
+                    // 🚨 LIQUIDATION DEFENSE TRIGGER 🚨
+                    if (coinState.position.risk >= CONFIG.LIQ_RISK_TRIGGER) {
+                        coinState.bot.status = `🚨 DEFENDING (RISK: ${coinState.position.risk.toFixed(1)}%)`;
+                        console.log(`[${coin}] HIGH RISK ${coinState.position.risk.toFixed(1)}%. Add: ${finalDefendQty}`);
+                        
+                        try {
+                            const defendSide = isLong ? 'buy' : 'sell';
+                            await exchange.createOrder(SYMBOL, 'market', defendSide, finalDefendQty);
+                            await new Promise(r => setTimeout(r, 3000));
+                        } catch(e) { console.error(`[${coin}] Defend Error:`, e.message); }
+                    } else {
+                        coinState.bot.status = `✅ HOLDING (Risk: ${coinState.position.risk.toFixed(1)}%)`;
+                    }
+                }
+
+            } catch (coinErr) {
+                console.error(`[${coin}] Loop Error:`, coinErr.message);
+                coinState.bot.status = "DATA ERROR";
+            }
+        } 
+
+        io.emit('update', state);
+
+    } catch (e) {
+        console.error("Global Loop Error:", e.message);
+    }
+}
+
+// ================= FRONTEND HTML =================
+const DASHBOARD_HTML = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Liquidation Bot</title>
+    <script src="https://cdn.jsdelivr.net/npm/socket.io-client@4/dist/socket.io.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root { --bg: #F3F5F7; --white: #FFFFFF; --text: #1E2329; --gray: #707A8A; --green: #0ECB81; --red: #F6465D; --blue: #2974FF; --orange: #F0B90B; }
+        body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 0; padding-bottom: 50px;}
+
+        /* TOP BAR */
+        .top-bar {
+            background: var(--white); padding: 15px 20px;
+            display: flex; justify-content: space-between; align-items: center;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.05); margin-bottom: 30px; position: sticky; top: 0; z-index: 100;
+        }
+        .top-label { font-size: 12px; color: var(--gray); font-weight: 500; text-transform: uppercase; }
+        .top-value { font-size: 18px; font-weight: 700; color: var(--text); }
+
+        .container { max-width: 800px; margin: 0 auto; padding: 0 15px; }
+        
+        .card { background: var(--white); border-radius: 12px; padding: 24px; box-shadow: 0 2px 12px rgba(0,0,0,0.04); margin-bottom: 20px; animation: fadeIn 0.5s ease; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+        .card-header { display: flex; justify-content: space-between; align-items: center; padding-bottom: 15px; border-bottom: 1px solid #F0F0F0; margin-bottom: 15px; }
+        .coin-info { display: flex; align-items: center; gap: 12px; }
+        .coin-icon { width: 40px; height: 40px; background: #212121; color: white; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 14px; }
+        .coin-name { font-size: 18px; font-weight: 700; }
+        .coin-price { font-size: 14px; color: var(--blue); font-family: monospace; font-weight: 600; }
+        
+        .badge { padding: 4px 10px; border-radius: 4px; font-size: 12px; font-weight: 600; background: #eee; }
+        .badge.active { background: rgba(14, 203, 129, 0.15); color: var(--green); }
+        .badge.alert { background: rgba(246, 70, 93, 0.15); color: var(--red); }
+
+        .stats-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px; row-gap: 20px; }
+        .stat-box { display: flex; flex-direction: column; }
+        .stat-label { font-size: 11px; color: var(--gray); text-transform: uppercase; margin-bottom: 4px; }
+        .stat-val { font-size: 15px; font-weight: 600; }
+        
+        .big-risk { font-size: 18px; font-weight: 800; }
+
+        .footer { margin-top: 20px; padding-top: 15px; border-top: 1px solid #F7F7F7; display: grid; grid-template-columns: 1fr 1fr 1fr; text-align: center; gap: 10px; }
+        .footer-item h4 { margin: 0 0 5px 0; font-size: 11px; color: var(--gray); }
+        .footer-item div { font-weight: 700; font-size: 14px; }
+
+        .green { color: var(--green); } .red { color: var(--red); } .blue { color: var(--blue); } .orange { color: var(--orange); }
+        
+        .risk-container { width: 100%; background: #eee; height: 6px; border-radius: 3px; margin-top: 5px; position:relative; overflow: hidden;}
+        .risk-fill { height: 100%; transition: width 0.3s; background: linear-gradient(90deg, #0ECB81 0%, #F0B90B 50%, #F6465D 90%); }
+        .risk-marker { position: absolute; left: ${CONFIG.LIQ_RISK_TRIGGER}%; top:0; height: 100%; width: 2px; background: black; opacity: 0.5;}
+
+        @media(max-width: 600px) {
+            .stats-grid { grid-template-columns: 1fr 1fr; }
+            .footer { grid-template-columns: 1fr; text-align: left; display: flex; justify-content: space-between; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="top-bar">
+    <div>
+        <div class="top-label">Liquidation Hunter Bot</div>
+        <div style="font-size:14px; font-weight:600;">${COIN_LIST.join(', ')}</div>
+    </div>
+    <div style="text-align:right;">
+        <div class="top-label">Total Balance</div>
+        <div class="top-value" id="walletBalance">0.00 USDT</div>
+    </div>
+</div>
+
+<div class="container" id="cardsContainer"></div>
+
+<script>
+    const socket = io();
+    const container = document.getElementById('cardsContainer');
+
+    socket.on('update', (data) => {
+        document.getElementById('walletBalance').innerText = parseFloat(data.wallet.balance).toFixed(2) + ' USDT';
+
+        Object.keys(data.coins).forEach(coin => {
+            const coinData = data.coins[coin];
+            let card = document.getElementById('card-' + coin);
+
+            if (!card) {
+                card = document.createElement('div');
+                card.className = 'card';
+                card.id = 'card-' + coin;
+                card.innerHTML = \`
+                    <div class="card-header">
+                        <div class="coin-info">
+                            <div class="coin-icon">\${coin.substring(0,3)}</div>
+                            <div>
+                                <div class="coin-name">\${coin}</div>
+                                <div class="coin-price" id="price-\${coin}">---</div>
+                            </div>
+                        </div>
+                        <div class="badge" id="badge-\${coin}">WAITING</div>
+                    </div>
+                    
+                    <div class="stats-grid">
+                        <div class="stat-box">
+                            <span class="stat-label">Status</span>
+                            <span class="stat-val" id="status-\${coin}">---</span>
+                        </div>
+                        <div class="stat-box">
+                            <span class="stat-label">Current Liq Risk %</span>
+                            <span class="stat-val big-risk" id="risk-val-\${coin}">0%</span>
+                        </div>
+                        <div class="stat-box">
+                            <span class="stat-label">Entry / Qty</span>
+                            <span class="stat-val"><span id="entry-\${coin}">0</span> <span style="font-size:12px;color:#999;">(<span id="qty-\${coin}">0</span>)</span></span>
+                        </div>
+                        <div class="stat-box">
+                            <span class="stat-label">Liquidation Price</span>
+                            <span class="stat-val red" id="liq-\${coin}">---</span>
+                        </div>
+                        <div class="stat-box">
+                            <span class="stat-label">ROI</span>
+                            <span class="stat-val" id="roi-\${coin}">0.00%</span>
+                        </div>
+                        <div class="stat-box">
+                            <span class="stat-label">Unrealized PNL</span>
+                            <span class="stat-val" id="pnl-\${coin}">0.00</span>
+                        </div>
+                    </div>
+
+                    <div class="footer">
+                        <div class="footer-item">
+                            <h4>Target</h4>
+                            <div class="green">+${CONFIG.TAKE_PROFIT_ROI}%</div>
+                        </div>
+                        <div class="footer-item">
+                            <h4>Recovery</h4>
+                            <div class="blue" id="rec-\${coin}">0</div>
+                        </div>
+                        <div class="footer-item" style="width:120px;">
+                            <h4>Risk Meter</h4>
+                            <div class="risk-container">
+                                <div class="risk-marker"></div>
+                                <div class="risk-fill" id="risk-bar-\${coin}" style="width:0%"></div>
+                            </div>
+                        </div>
+                    </div>
+                \`;
+                container.appendChild(card);
+            }
+
+            // Updates
+            document.getElementById('price-' + coin).innerText = coinData.market.markPrice.toFixed(coinData.market.price < 1 ? 6 : 2);
+            document.getElementById('status-' + coin).innerText = coinData.bot.status;
+            
+            document.getElementById('liq-' + coin).innerText = coinData.position.liqPrice > 0 ? coinData.position.liqPrice.toFixed(4) : 'SAFE';
+            document.getElementById('entry-' + coin).innerText = coinData.position.entry.toFixed(coinData.position.entry < 1 ? 6 : 2);
+            document.getElementById('qty-' + coin).innerText = coinData.position.qty;
+            
+            // PNL
+            const pnl = coinData.position.upnl;
+            const pnlEl = document.getElementById('pnl-' + coin);
+            pnlEl.innerText = (pnl >= 0 ? '+' : '') + pnl.toFixed(2) + ' $';
+            pnlEl.className = 'stat-val ' + (pnl >= 0 ? 'green' : 'red');
+
+            // ROI
+            const roi = coinData.position.roi;
+            const roiEl = document.getElementById('roi-' + coin);
+            roiEl.innerText = roi.toFixed(2) + '%';
+            roiEl.className = 'stat-val ' + (roi >= 0 ? 'green' : 'red');
+
+            // RISK (Percent Display)
+            const risk = coinData.position.risk;
+            const riskEl = document.getElementById('risk-val-' + coin);
+            riskEl.innerText = risk.toFixed(2) + '%';
+            
+            // Risk Color Logic
+            if(risk >= ${CONFIG.LIQ_RISK_TRIGGER}) riskEl.className = 'stat-val big-risk red';
+            else if(risk > 50) riskEl.className = 'stat-val big-risk orange';
+            else riskEl.className = 'stat-val big-risk green';
+
+            document.getElementById('risk-bar-' + coin).style.width = risk + '%';
+
+            // Recovery Text
+            const rec = parseFloat(coinData.bot.recoveryQty);
+            document.getElementById('rec-' + coin).innerText = rec > 0 ? ('+' + parseFloat(rec).toString()) : '0';
+            
+            // Badge Logic
+            const badge = document.getElementById('badge-' + coin);
+            if(coinData.bot.status.includes('TP HIT')) {
+                badge.className = 'badge active'; badge.innerText = 'WIN';
+            } else if(coinData.bot.status.includes('DEFEND')) {
+                badge.className = 'badge alert'; badge.innerText = 'RESCUE';
+            } else if(coinData.position.qty > 0) {
+                badge.className = 'badge'; badge.innerText = 'OPEN';
+            } else {
+                badge.className = 'badge'; badge.innerText = 'SCANNING';
+            }
+        });
+    });
+</script>
+</body>
+</html>
+`;
+
+// ================= SERVER =================
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+app.get('/', (req, res) => res.send(DASHBOARD_HTML));
+
+server.listen(PORT, () => {
+    console.log(`🤖 LIQ HUNTER BOT ACTIVE on http://localhost:${PORT}`);
+    console.log(`Coins: ${COIN_LIST.join(', ')}`);
+    console.log(`Entry: MinQty x ${CONFIG.ENTRY_MULTIPLIER}`);
+    console.log(`Leverage: ${CONFIG.LEVERAGE}x (Always Enforced)`);
+    console.log(`Defends at: ${CONFIG.LIQ_RISK_TRIGGER}% Liquidation Risk`);
+    setInterval(run, CONFIG.POLL_RATE);
+});
