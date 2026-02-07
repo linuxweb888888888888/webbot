@@ -1,0 +1,740 @@
+/******************************************************************************************
+    ⚡ IRONCLAD PROFIT GUARD v2.2 (Global Harvest & Unified Chase)
+    
+    1. ENTRY: Limit Chase @ Bid/Ask.
+    2. TP: Limit Chase @ Bid/Ask.
+    3. STOP LOSS: Limit Chase @ Bid/Ask.
+    4. SACRIFICE: Separated per account. 10 wins = Cut loser.
+    5. HARVEST: Every 10 mins, closes HIGHEST ROI position across ALL accounts.
+    6. UI: Global PnL (8-Decimal) + Harvest Timer.
+******************************************************************************************/
+
+const fs = require('fs');
+const dotenv = require('dotenv');
+const express = require('express');
+const http = require('http');
+const https = require('https'); 
+const { Server } = require('socket.io');
+const ccxt = require('ccxt');
+const minimist = require('minimist');
+
+// ================= CONFIGURATION =================
+const args = minimist(process.argv.slice(2));
+
+// Default high-volatility list
+const rawCoinArg = args.coin || 'BTC ETH SOL XRP ADA DOGE LINK DOT 1000SATS PEPE';
+const COIN_LIST = rawCoinArg.toString().split(/[\s,]+/).filter(c => c).map(c => c.toUpperCase());
+const PORT = parseInt(args.port) || 3000;
+
+const CONFIG = {
+    TAKE_PROFIT_ROI: 50,       // Target ROI % 
+    STOP_LOSS_ROI: -0.8,       // Stop Loss ROI % (Triggers Limit Exit)
+    LIQ_RISK_TRIGGER: 60,      // Liquidation Risk Threshold % (Starts DCA)
+    MAX_RISK_EXIT: 200,        // Risk cap
+    TARGET_RECOVERY_ROI: 35,   // DCA Recovery Target %
+    LEVERAGE: 5,               // Leverage
+    ENTRY_MULTIPLIER: 1,       // Keep at 1
+    POLL_RATE: 3500,           // 3.5s Refresh Rate
+    HTTP_TIMEOUT: 10000,       // Request Timeout
+    EST_FEE_RATE: 0.0006,      // 0.06% Taker Fee Est
+    MIN_PRICE_MOVE: 0.002,     // 0.2% Move required for TP validity
+    TP_CONFIRM_MS: 1000,       // 1 Second Wait time to confirm trend before TP
+    SACRIFICE_THRESHOLD: 10,   // Number of wins PER ACCOUNT before cutting a loser
+    HARVEST_INTERVAL_MS: 0.5 * 60 * 1000 // 10 Minutes
+};
+
+// 🌍 GLOBAL STATE
+let GLOBAL_OPEN_LONGS = 0;
+let GLOBAL_OPEN_SHORTS = 0;
+let NEXT_HARVEST_TIME = Date.now() + CONFIG.HARVEST_INTERVAL_MS;
+
+// Shared Agent for KeepAlive connections
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, timeout: CONFIG.HTTP_TIMEOUT });
+
+// ================= UTILITIES =================
+
+function parseEnvFile(filePath) {
+    try {
+        const content = fs.readFileSync(filePath);
+        const config = dotenv.parse(content);
+        if (!config.PHEMEX_KEY || !config.PHEMEX_SECRET) return { key: null, secret: null };
+        return { key: config.PHEMEX_KEY, secret: config.PHEMEX_SECRET };
+    } catch (e) { return { key: null, secret: null }; }
+}
+
+function calculateLiqRisk(side, entry, mark, leverage, mmr = 0.005) {
+    if (!entry || !mark) return 0;
+    let liqPrice = side === 'long' 
+        ? entry * (1 - (1 / leverage) + mmr) 
+        : entry * (1 + (1 / leverage) - mmr);
+    
+    const distToLiq = Math.abs(mark - liqPrice);
+    const distTotal = Math.abs(entry - liqPrice);
+    
+    if (distTotal === 0) return 100;
+    let risk = ((distTotal - distToLiq) / distTotal) * 100;
+    return Math.max(0, Math.min(100, risk));
+}
+
+function calculateRecoveryQty(side, currentPrice, currentEntry, currentQty, targetRoi, leverage) {
+    const roiDecimal = targetRoi / 100;
+    let targetAvgEntry = side === 'long' 
+        ? currentPrice / ((roiDecimal / leverage) + 1)
+        : currentPrice / (1 - (roiDecimal / leverage));
+    
+    if ((side === 'long' && targetAvgEntry >= currentPrice) || 
+        (side === 'short' && targetAvgEntry <= currentPrice)) return 0;
+    
+    const denom = Math.abs(targetAvgEntry - currentPrice);
+    if (denom < 0.00000001) return 0;
+
+    const numerator = currentQty * (currentEntry - targetAvgEntry);
+    return Math.abs(numerator / denom);
+}
+
+// ================= GLOBAL MARKET DATA MANAGER =================
+const publicExchange = new ccxt.phemex({
+    enableRateLimit: true,
+    agent: httpsAgent,
+    options: { defaultType: 'swap' }
+});
+
+// ================= ACCOUNT CLASS =================
+
+class TradingAccount {
+    constructor(id, filename, creds) {
+        this.id = id;
+        this.name = filename;
+        this.isReady = false;
+        // Private exchange instance
+        this.exchange = new ccxt.phemex({
+            apiKey: creds.key, secret: creds.secret, enableRateLimit: true, agent: httpsAgent, 
+            options: { defaultType: 'swap', adjustForTimeDifference: true } 
+        });
+        this.data = {
+            wallet: { balance: 0, equity: 0, totalUpnl: 0 },
+            activeCoinsCount: 0, maxRisk: 0, tickDuration: 0, 
+            sacrificeCounter: 0, 
+            coins: {}, history: [] 
+        };
+        this.symbols = {}; 
+        this.prevPositions = {}; 
+    }
+
+    async init() {
+        try {
+            console.log(`[${this.id}] 📡 Loading Markets...`);
+            const markets = await this.exchange.loadMarkets();
+            
+            const initPromises = COIN_LIST.map(async (coin) => {
+                const swapSymbol = Object.keys(markets).find(s => 
+                    markets[s].base === coin && 
+                    markets[s].quote === 'USDT' && 
+                    markets[s].linear === true
+                );
+                
+                if (swapSymbol) {
+                    this.symbols[coin] = swapSymbol;
+                    const marketInfo = markets[swapSymbol];
+                    
+                    let minAmount = marketInfo.limits.amount.min;
+                    if (!minAmount) minAmount = marketInfo.precision.amount;
+                    if (!minAmount) minAmount = 1; 
+
+                    this.data.coins[coin] = {
+                        symbol: swapSymbol, 
+                        limits: { minAmount: parseFloat(minAmount) }, 
+                        market: { price: 0, markPrice: 0, bid: 0, ask: 0 },
+                        position: { qty: 0, entry: 0, upnl: 0, roi: 0, realRoi: 0, risk: 0, side: 'NONE' },
+                        bot: { 
+                            status: 'IDLE', lastAction: 0, retryUntil: 0, openTime: 0, 
+                            tpStart: 0, tpOrderId: null, tpLastPrice: 0,
+                            dcaOrderId: null, dcaLastPrice: 0,
+                            entryOrderId: null, entryLastPrice: 0,
+                            slOrderId: null, slLastPrice: 0,
+                            forceHarvest: false // New flag for Global Harvest
+                        }
+                    };
+                    this.prevPositions[coin] = { qty: 0, entry: 0, side: 'NONE', openTime: 0 };
+                    try { await this.exchange.setLeverage(CONFIG.LEVERAGE, swapSymbol); } catch(err) {}
+                }
+            });
+            await Promise.all(initPromises);
+            this.isReady = true;
+            console.log(`[${this.id}] ✅ Initialized.`);
+        } catch (e) { console.error(`[${this.id}] 💀 Init Failed:`, e.message); }
+    }
+
+    async closeAllPositions() {
+        if (!this.isReady) return;
+        console.log(`[${this.id}] 🚨 MANUAL CLOSE TRIGGERED!`);
+        try {
+            const knownSymbols = Object.values(this.symbols);
+            const positions = await this.exchange.fetchPositions(knownSymbols);
+            const activePositions = positions.filter(p => Math.abs(parseFloat(p.contracts || p.amount)) > 0);
+            
+            await Promise.all(activePositions.map(async (pos) => {
+                const amount = Math.abs(parseFloat(pos.contracts || pos.amount));
+                const side = pos.side === 'long' ? 'sell' : 'buy'; 
+                try {
+                    await this.exchange.cancelAllOrders(pos.symbol);
+                    await this.exchange.createOrder(pos.symbol, 'market', side, amount, undefined, {'reduceOnly': true});
+                    console.log(`[${this.id}] 💥 Closed ${pos.symbol}`);
+                } catch (err) { console.error(`[${this.id}] ❌ Close Failed ${pos.symbol}: ${err.message}`); }
+            }));
+
+            // Reset local state
+            Object.values(this.data.coins).forEach(c => {
+                c.bot.status = 'IDLE'; 
+                c.bot.retryUntil = Date.now() + 2000;
+                c.bot.entryOrderId = null; c.bot.tpOrderId = null; c.bot.dcaOrderId = null; c.bot.slOrderId = null;
+                c.bot.forceHarvest = false;
+            });
+            this.data.sacrificeCounter = 0; 
+        } catch (e) { console.error(`[${this.id}] Cleanup Error:`, e.message); }
+    }
+
+    // ---------------------------------------------------------
+    // ⚙️ UNIFIED LIMIT CHASE LOGIC
+    // Used for: Entry, Take Profit, Stop Loss, Harvest
+    // ---------------------------------------------------------
+    async manageLimitChase(coinState, symbol, side, qty, targetPrice, orderTypeTag, params = {}) {
+        const orderIdKey = `${orderTypeTag}OrderId`;
+        const lastPriceKey = `${orderTypeTag}LastPrice`;
+
+        // 1. Calculate Safe Price
+        const safePrice = parseFloat(this.exchange.priceToPrecision(symbol, targetPrice));
+        
+        // 2. Check if we need to move the order
+        if (coinState.bot[orderIdKey]) {
+            const currentOrderPrice = coinState.bot[lastPriceKey];
+            const drift = Math.abs(safePrice - currentOrderPrice);
+            const threshold = coinState.market.price * 0.0005; // 0.05% drift allowance
+
+            if (drift > threshold) {
+                // Price moved too much, cancel old order
+                try {
+                    await this.exchange.cancelOrder(coinState.bot[orderIdKey], symbol);
+                } catch (e) { /* Ignore not found */ }
+                coinState.bot[orderIdKey] = null;
+            }
+        }
+
+        // 3. Place New Order if needed
+        if (!coinState.bot[orderIdKey]) {
+            try {
+                const safeQty = parseFloat(this.exchange.amountToPrecision(symbol, qty));
+                if (safeQty <= 0) return;
+
+                console.log(`[${this.id}] 🎢 ${orderTypeTag.toUpperCase()} ${symbol} ${side} @ ${safePrice}`);
+                const order = await this.exchange.createOrder(symbol, 'limit', side, safeQty, safePrice, params);
+                
+                coinState.bot[orderIdKey] = order.id;
+                coinState.bot[lastPriceKey] = safePrice;
+                coinState.bot.status = `${orderTypeTag.toUpperCase()}_SENT`;
+
+                if(orderTypeTag === 'entry') coinState.bot.openTime = Date.now();
+
+            } catch(e) {
+                console.warn(`[${this.id}] ${orderTypeTag} Fail: ${e.message}`);
+                coinState.bot[orderIdKey] = null;
+                // Back off slightly on error
+                coinState.bot.retryUntil = Date.now() + 1000;
+            }
+        }
+    }
+
+    async update(sharedTickers) {
+        if (!this.isReady) return;
+        const startTick = Date.now();
+        try {
+            const symbolsToFetch = Object.values(this.symbols);
+            if(symbolsToFetch.length === 0) return;
+
+            const [balanceData, positionsData] = await Promise.all([
+                this.exchange.fetchBalance({ type: 'swap', code: 'USDT' }).catch(e => null),
+                this.exchange.fetchPositions(symbolsToFetch).catch(e => [])
+            ]);
+
+            if (!balanceData) return; 
+            
+            this.data.wallet.balance = parseFloat(balanceData.USDT?.total || balanceData.total?.USDT || 0);
+            this.data.wallet.totalUpnl = 0;
+            this.data.activeCoinsCount = 0;
+            this.data.maxRisk = 0;
+
+            const posMap = new Map();
+            positionsData.forEach(p => {
+                if (Object.values(this.symbols).includes(p.symbol)) {
+                    posMap.set(p.symbol, p);
+                }
+            });
+            
+            const logicPromises = COIN_LIST.map(async (coin) => {
+                const coinState = this.data.coins[coin];
+                if (!coinState) return;
+                
+                const SYMBOL = coinState.symbol;
+                
+                // ⚡ USE SHARED TICKER DATA
+                const ticker = sharedTickers[SYMBOL];
+                if (ticker) {
+                    coinState.market.price = ticker.last;
+                    coinState.market.markPrice = ticker.info.markPrice ? parseFloat(ticker.info.markPrice) : ticker.last;
+                    coinState.market.bid = ticker.bid || ticker.last;
+                    coinState.market.ask = ticker.ask || ticker.last;
+                }
+
+                const pos = posMap.get(SYMBOL);
+                const hasPos = pos && parseFloat(pos.contracts || pos.amount) > 0;
+                const prevPos = this.prevPositions[coin];
+
+                if (hasPos) {
+                    const rawSize = Math.abs(parseFloat(pos.contracts || pos.amount));
+                    
+                    // New Position Detected
+                    if (prevPos.qty === 0) {
+                        coinState.bot.openTime = Date.now();
+                        coinState.bot.status = 'HOLDING'; 
+                        // Cancel Entry Order remnants
+                        if (coinState.bot.entryOrderId) {
+                            try { await this.exchange.cancelOrder(coinState.bot.entryOrderId, SYMBOL); } catch(e){}
+                        }
+                        coinState.bot.entryOrderId = null;
+                    }
+
+                    coinState.position.qty = rawSize;
+                    coinState.position.entry = parseFloat(pos.entryPrice);
+                    coinState.position.side = pos.side;
+
+                    let exitPrice = pos.side === 'long' ? coinState.market.bid : coinState.market.ask;
+                    let uPnL = pos.side === 'long' 
+                        ? (exitPrice - coinState.position.entry) * rawSize 
+                        : (coinState.position.entry - exitPrice) * rawSize;
+                    
+                    const marginUsed = (rawSize * coinState.position.entry) / CONFIG.LEVERAGE;
+                    let markPnL = pos.side === 'long' 
+                        ? (coinState.market.markPrice - coinState.position.entry) * rawSize 
+                        : (coinState.position.entry - coinState.market.markPrice) * rawSize;
+
+                    coinState.position.roi = marginUsed > 0 ? (markPnL / marginUsed) * 100 : 0;
+                    coinState.position.realRoi = marginUsed > 0 ? (uPnL / marginUsed) * 100 : 0;
+                    coinState.position.upnl = uPnL;
+                    coinState.position.risk = calculateLiqRisk(pos.side, coinState.position.entry, coinState.market.markPrice, CONFIG.LEVERAGE);
+
+                    this.data.wallet.totalUpnl += uPnL;
+                    this.data.activeCoinsCount++;
+                    if(coinState.position.risk > this.data.maxRisk) this.data.maxRisk = coinState.position.risk;
+
+                    this.prevPositions[coin] = { qty: rawSize, entry: coinState.position.entry, side: pos.side, openTime: coinState.bot.openTime || Date.now() };
+
+                } else {
+                    // Position Closed
+                    if (prevPos.qty > 0) {
+                        const closePrice = (prevPos.side === 'long') ? coinState.market.bid : coinState.market.ask;
+                        this.recordHistory(coin, prevPos, closePrice);
+                        // CLEANUP ALL
+                        ['tp', 'dca', 'sl', 'entry'].forEach(tag => {
+                            if (coinState.bot[`${tag}OrderId`]) {
+                                this.exchange.cancelOrder(coinState.bot[`${tag}OrderId`], SYMBOL).catch(() => {});
+                            }
+                        });
+                    }
+                    // Reset State
+                    coinState.position.qty = 0; coinState.position.upnl = 0; coinState.position.roi = 0; 
+                    coinState.position.realRoi = 0; coinState.position.risk = 0; coinState.position.side = 'NONE';
+                    coinState.bot.status = 'IDLE';
+                    coinState.bot.tpStart = 0; coinState.bot.forceHarvest = false;
+                    
+                    coinState.bot.tpOrderId = null; coinState.bot.dcaOrderId = null; 
+                    coinState.bot.slOrderId = null; coinState.bot.entryOrderId = null;
+
+                    this.prevPositions[coin] = { qty: 0, entry: 0, side: 'NONE', openTime: 0 };
+                }
+                
+                await this.executeLogic(coin, coinState, SYMBOL);
+            });
+
+            await Promise.all(logicPromises);
+            this.data.wallet.equity = this.data.wallet.balance + this.data.wallet.totalUpnl;
+            this.data.tickDuration = Date.now() - startTick;
+        } catch (e) { console.error(`[${this.id}] Cycle Error:`, e.message); }
+    }
+
+    recordHistory(coin, prevPos, closePrice) {
+        let pnl = 0;
+        let sideLabel = prevPos.side === 'long' ? `LONG ${coin}` : `SHORT ${coin}`;
+        if (prevPos.side === 'long') pnl = (closePrice - prevPos.entry) * prevPos.qty;
+        else pnl = (prevPos.entry - closePrice) * prevPos.qty;
+
+        const entryVal = prevPos.qty * prevPos.entry;
+        const estFee = (entryVal + (prevPos.qty * closePrice)) * CONFIG.EST_FEE_RATE;
+        const netPnl = pnl - estFee;
+        const margin = entryVal / CONFIG.LEVERAGE;
+        const roi = margin > 0 ? (netPnl / margin) * 100 : 0;
+
+        if (netPnl > 0) {
+            this.data.sacrificeCounter++;
+            console.log(`[${this.id}] 🪙 Profitable Trade! Progress: ${this.data.sacrificeCounter} / ${CONFIG.SACRIFICE_THRESHOLD}`);
+        }
+
+        const tradeRecord = {
+            symbol: `${coin}USDT`, marginType: 'Cross', totalSize: sideLabel,
+            openPrice: prevPos.entry, closePrice: closePrice, pnl: netPnl, roi: roi,
+            openTime: prevPos.openTime, closeTime: Date.now()
+        };
+        this.data.history.unshift(tradeRecord);
+        if (this.data.history.length > 20) this.data.history.pop();
+    }
+
+    async executeLogic(coin, state, symbol) {
+        if (Date.now() < state.bot.retryUntil) return;
+        if (!state.market.price || state.market.price === 0) return;
+
+        // ================= A. ENTRY LOGIC (LIMIT CHASE) =================
+        if (state.position.qty === 0) {
+            // Determine side based on balance
+            let side = 'buy'; 
+            if (GLOBAL_OPEN_SHORTS < GLOBAL_OPEN_LONGS) side = 'sell'; 
+            else if (GLOBAL_OPEN_LONGS < GLOBAL_OPEN_SHORTS) side = 'buy'; 
+            else side = (COIN_LIST.indexOf(coin) % 2 === 0) ? 'buy' : 'sell';
+
+            const limitPrice = side === 'buy' ? state.market.bid : state.market.ask;
+            const rawQty = state.limits.minAmount * CONFIG.ENTRY_MULTIPLIER;
+            
+            // Call Unified Chase
+            await this.manageLimitChase(state, symbol, side, rawQty, limitPrice, 'entry');
+        }
+        
+        // ================= B. POSITION MANAGEMENT =================
+        else {
+            // Ensure Entry is cancelled
+            if (state.bot.entryOrderId) {
+                try { await this.exchange.cancelOrder(state.bot.entryOrderId, symbol); } catch (e) {}
+                state.bot.entryOrderId = null;
+            }
+
+            const isLong = state.position.side === 'long';
+            const exitSide = isLong ? 'sell' : 'buy';
+            const exitPrice = isLong ? state.market.bid : state.market.ask;
+
+            // 1. HARVEST (Forced Global TP) OR STANDARD TP
+            let doTakeProfit = false;
+            
+            // Check Standard TP Criteria
+            if (state.position.realRoi >= CONFIG.TAKE_PROFIT_ROI) {
+                const requiredMove = state.position.entry * CONFIG.MIN_PRICE_MOVE;
+                const isPriceMoveOk = isLong ? (exitPrice >= state.position.entry + requiredMove) : (exitPrice <= state.position.entry - requiredMove);
+                if (isPriceMoveOk) {
+                    if (state.bot.tpStart === 0) state.bot.tpStart = Date.now();
+                    else if (Date.now() - state.bot.tpStart >= CONFIG.TP_CONFIRM_MS) doTakeProfit = true;
+                }
+            } else {
+                state.bot.tpStart = 0;
+            }
+
+            // Check Forced Harvest
+            if (state.bot.forceHarvest === true) {
+                doTakeProfit = true; // Override normal TP logic
+            }
+
+            if (doTakeProfit) {
+                // Cancel conflicting SL/DCA orders
+                if (state.bot.slOrderId) { await this.exchange.cancelOrder(state.bot.slOrderId, symbol).catch(()=>{}); state.bot.slOrderId = null; }
+                if (state.bot.dcaOrderId) { await this.exchange.cancelOrder(state.bot.dcaOrderId, symbol).catch(()=>{}); state.bot.dcaOrderId = null; }
+
+                // Execute Limit Chase for TP
+                await this.manageLimitChase(state, symbol, exitSide, state.position.qty, exitPrice, 'tp', {'reduceOnly': true});
+                return; // Prioritize exit
+            } else {
+                // Cancel lingering TP if conditions lost
+                if (state.bot.tpOrderId) {
+                    await this.exchange.cancelOrder(state.bot.tpOrderId, symbol).catch(()=>{});
+                    state.bot.tpOrderId = null; 
+                    state.bot.status = 'HOLDING';
+                }
+            }
+
+            // 2. STOP LOSS (LIMIT CHASE)
+            if (state.position.realRoi <= CONFIG.STOP_LOSS_ROI) {
+                // Cancel conflicting TP/DCA
+                if (state.bot.tpOrderId) { await this.exchange.cancelOrder(state.bot.tpOrderId, symbol).catch(()=>{}); state.bot.tpOrderId = null; }
+                if (state.bot.dcaOrderId) { await this.exchange.cancelOrder(state.bot.dcaOrderId, symbol).catch(()=>{}); state.bot.dcaOrderId = null; }
+
+                // Execute Limit Chase for SL
+                await this.manageLimitChase(state, symbol, exitSide, state.position.qty, exitPrice, 'sl', {'reduceOnly': true});
+                return;
+            } else {
+                if (state.bot.slOrderId) {
+                    await this.exchange.cancelOrder(state.bot.slOrderId, symbol).catch(()=>{});
+                    state.bot.slOrderId = null;
+                    state.bot.status = 'HOLDING';
+                }
+            }
+
+            // 3. DCA (LIMIT CHASE)
+            if (state.position.risk >= CONFIG.LIQ_RISK_TRIGGER && state.position.risk <= CONFIG.MAX_RISK_EXIT) {
+                const needed = calculateRecoveryQty(state.position.side, state.market.markPrice, state.position.entry, state.position.qty, CONFIG.TARGET_RECOVERY_ROI, CONFIG.LEVERAGE);
+                let qty = Math.min(needed, state.position.qty * 1.5); 
+                if(qty < state.limits.minAmount) qty = state.limits.minAmount;
+                
+                const dcaSide = isLong ? 'buy' : 'sell'; 
+                const dcaPrice = isLong ? state.market.bid : state.market.ask;
+
+                // Execute Limit Chase for DCA
+                await this.manageLimitChase(state, symbol, dcaSide, qty, dcaPrice, 'dca');
+            } else {
+                if (state.bot.dcaOrderId) {
+                    await this.exchange.cancelOrder(state.bot.dcaOrderId, symbol).catch(()=>{});
+                    state.bot.dcaOrderId = null;
+                }
+            }
+        }
+    }
+}
+
+// ================= INITIALIZATION =================
+const accInstances = [];
+const envFiles = fs.readdirSync(process.cwd()).filter(fn => fn.startsWith('.env') && !fn.endsWith('example'));
+if (envFiles.length === 0) { console.error("❌ No .env files found!"); process.exit(1); }
+
+envFiles.forEach((filename) => {
+    const id = filename.split('.')[2] || 'Main';
+    const creds = parseEnvFile(filename);
+    if(creds.key && creds.secret) {
+        accInstances.push(new TradingAccount(id.toUpperCase(), filename, creds));
+    } else {
+        console.warn(`Skipping ${filename} - Missing keys`);
+    }
+});
+
+// ================= SERVER =================
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: "*" } });
+
+app.post('/close-all', async (req, res) => {
+    console.log("\n🛑 MANUAL CLOSE COMMAND RECEIVED 🛑");
+    await Promise.all(accInstances.map(a => a.closeAllPositions()));
+    res.json({ success: true, message: "Close command sent to all accounts." });
+});
+
+async function mainLoop() {
+    try {
+        // ⚡ GLOBAL PRICE FETCH (OPTIMIZATION)
+        const allSymbols = [...new Set(accInstances.flatMap(acc => Object.values(acc.symbols)))];
+        let sharedTickers = {};
+        if (allSymbols.length > 0) {
+            try {
+                sharedTickers = await publicExchange.fetchTickers(allSymbols);
+            } catch (e) {
+                console.error("⚠️ Global Ticker Fetch Failed:", e.message);
+            }
+        }
+
+        await Promise.all(accInstances.map(acc => acc.update(sharedTickers)));
+        
+        // 📊 GLOBAL STATS AGGREGATION & HARVEST LOGIC
+        let tLongs = 0, tShorts = 0;
+        let tGlobalPnL = 0; 
+
+        // 🌽 CHECK HARVEST TIMER 🌽
+        const now = Date.now();
+        if (now >= NEXT_HARVEST_TIME) {
+            console.log("\n🌾 HARVEST TIME! Hunting highest ROI position...");
+            let bestPos = null;
+            let bestRoi = -99999;
+            let bestAcc = null;
+
+            // Find the best position across ALL accounts
+            for (const acc of accInstances) {
+                Object.values(acc.data.coins).forEach(c => {
+                    if (c.position.qty > 0 && c.position.roi > bestRoi) {
+                        bestRoi = c.position.roi;
+                        bestPos = c;
+                        bestAcc = acc;
+                    }
+                });
+            }
+
+            if (bestPos && bestAcc) {
+                console.log(`🌟 HARVESTING: [${bestAcc.id}] ${bestPos.symbol} @ ROI ${bestRoi.toFixed(2)}%`);
+                bestPos.bot.forceHarvest = true; // Signals the bot to exit via Limit Chase next tick
+            } else {
+                console.log("🌾 Harvest failed: No active positions.");
+            }
+            
+            NEXT_HARVEST_TIME = now + CONFIG.HARVEST_INTERVAL_MS;
+        }
+        
+        for (const acc of accInstances) {
+            tGlobalPnL += acc.data.wallet.totalUpnl;
+
+            Object.values(acc.data.coins).forEach(c => {
+                if (c.position.qty > 0) {
+                    if (c.position.side === 'long') tLongs++;
+                    else if (c.position.side === 'short') tShorts++;
+                }
+            });
+
+            // 🩸 PER-ACCOUNT SACRIFICE LOGIC 🩸
+            if (acc.data.sacrificeCounter >= CONFIG.SACRIFICE_THRESHOLD) {
+                console.log(`\n🔪 [${acc.id}] SACRIFICE THRESHOLD REACHED (${acc.data.sacrificeCounter} Wins). Hunting loser...`);
+                
+                let worstPos = null;
+                let worstRoi = -0.01; 
+
+                Object.values(acc.data.coins).forEach(coin => {
+                    if (coin.position.qty > 0 && coin.position.roi < worstRoi) {
+                        worstRoi = coin.position.roi;
+                        worstPos = coin;
+                    }
+                });
+
+                if (worstPos) {
+                    console.log(`💀 SACRIFICING in [${acc.id}]: ${worstPos.symbol} (ROI: ${worstRoi.toFixed(2)}%)`);
+                    try {
+                        await acc.exchange.cancelAllOrders(worstPos.symbol).catch(() => {});
+                        const side = worstPos.position.side === 'long' ? 'sell' : 'buy';
+                        await acc.exchange.createOrder(worstPos.symbol, 'market', side, worstPos.position.qty, undefined, {'reduceOnly': true});
+                        console.log(`✅ SACRIFICE COMPLETE: ${worstPos.symbol}`);
+                        worstPos.bot.status = 'IDLE';
+                        worstPos.bot.retryUntil = Date.now() + 2000; 
+                    } catch(e) { console.error(`❌ Sacrifice Failed [${acc.id}]:`, e.message); }
+                } else {
+                    console.log(`✨ [${acc.id}] No negative positions found to sacrifice.`);
+                }
+                
+                acc.data.sacrificeCounter = 0;
+            }
+        }
+        
+        GLOBAL_OPEN_LONGS = tLongs;
+        GLOBAL_OPEN_SHORTS = tShorts;
+
+        const payload = {
+            threshold: CONFIG.SACRIFICE_THRESHOLD,
+            harvestTime: NEXT_HARVEST_TIME, // Send harvest time to UI
+            globalStats: { longs: GLOBAL_OPEN_LONGS, shorts: GLOBAL_OPEN_SHORTS, totalPnL: tGlobalPnL },
+            accounts: accInstances.map(a => ({ id: a.id, name: a.name, ...a.data }))
+        };
+        io.emit('update', payload);
+    } catch (e) { console.error("❌ MAIN LOOP ERROR:", e.message); }
+    setTimeout(mainLoop, CONFIG.POLL_RATE);
+}
+
+process.on('uncaughtException', (err) => {
+    console.error('🔥 UNCAUGHT EXCEPTION:', err);
+});
+
+// ================= DASHBOARD HTML =================
+const DASHBOARD_HTML = `
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>⚡ Bot Dashboard</title>
+<script src="/socket.io/socket.io.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+    :root { --bg: #f5f7fa; --card: #ffffff; --text-primary: #1f2937; --text-secondary: #6b7280; --green: #059669; --red: #dc2626; --orange: #d97706; --border: #e5e7eb; --shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1); }
+    body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-primary); padding: 24px; font-size: 13px; margin: 0; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 24px; }
+    .card { background: var(--card); border-radius: 12px; padding: 24px; border: 1px solid var(--border); box-shadow: var(--shadow); display: flex; flex-direction: column; }
+    .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
+    .title { font-weight: 700; color: var(--text-primary); font-size: 16px; }
+    .tick { font-family: 'JetBrains Mono'; font-size: 11px; color: var(--text-secondary); background: #f3f4f6; padding: 2px 6px; border-radius: 4px; }
+    .stat-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; }
+    .stat-label { color: var(--text-secondary); font-weight: 500; }
+    .val { font-family: 'JetBrains Mono', monospace; font-weight: 700; }
+    .green { color: var(--green); } .red { color: var(--red); }
+    .history-container { margin-top: 20px; border-top: 1px solid var(--border); padding-top: 16px; max-height: 280px; overflow-y: auto; }
+    table { width: 100%; border-collapse: collapse; font-family: 'Inter', sans-serif; font-size: 12px; }
+    th { text-align: left; color: var(--text-secondary); font-weight: 600; padding: 8px 4px; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--card); }
+    td { padding: 10px 4px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+    .td-sym { font-weight: 600; color: var(--text-primary); } 
+    .td-pnl-val { font-family: 'JetBrains Mono'; font-size: 12px; font-weight: 600; } 
+    .td-time { color: var(--text-secondary); font-size: 11px; line-height: 1.2; }
+    .nav { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; background: var(--card); padding: 16px 24px; border-radius: 12px; border: 1px solid var(--border); box-shadow: var(--shadow); }
+    .nav h2 { margin: 0; font-size: 18px; color: var(--text-primary); }
+    .btn-panic { background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; padding: 10px 20px; font-weight: 600; border-radius: 6px; cursor: pointer; transition: all 0.2s; font-family: 'Inter', sans-serif; font-size: 13px; }
+    .btn-panic:hover { background: #fecaca; color: #991b1b; }
+    .sacrifice-alert { background: #fee2e2; color: #b91c1c; font-weight: 700; padding: 10px; border-radius: 6px; text-align: center; margin-top: 10px; margin-bottom: 10px; font-size: 12px; border: 1px solid #fecaca; }
+    .harvest-alert { background: #fef3c7; color: #b45309; border: 1px solid #fcd34d; font-weight: 700; padding: 5px 10px; border-radius: 6px; font-size: 12px; display:inline-block; margin-left: 10px; }
+    .global-pnl-box { font-family: 'JetBrains Mono'; font-weight: 700; font-size: 16px; margin-right: 15px; }
+</style>
+</head><body>
+<div class="nav">
+    <div style="display:flex; flex-direction:column;">
+        <h2>⚡ Ironclad Bot v2.2 <span style="font-size:14px; font-weight:400; color:var(--text-secondary); margin-left:8px;">| ${COIN_LIST.length} Active Coins</span> <span id="harvest-timer" class="harvest-alert">🌾 Harvest in: --:--</span></h2>
+        <div id="perf-stats" style="display:flex; align-items:center; margin-top:5px; color:var(--text-secondary);">Connecting...</div>
+    </div>
+    <button class="btn-panic" onclick="closeAllPositions()">🚨 CLOSE ALL POSITIONS</button>
+</div>
+<div class="grid" id="app"></div>
+<script>
+    const socket = io();
+    function fmtPrice(p) { if (p < 0.0001) return p.toFixed(9); if (p < 0.01) return p.toFixed(7); if (p < 1) return p.toFixed(5); return p.toFixed(3); }
+    function fmtDate(ms) { if(!ms) return '-'; return new Date(ms).toISOString().replace('T', ' ').slice(0, 19); }
+    
+    function closeAllPositions() {
+        if(confirm("⚠️ CONFIRM CLOSE ALL? ⚠️\\n\\nThis will market-close ALL positions immediately.")) {
+            fetch('/close-all', { method: 'POST' }).then(r=>r.json()).then(d=>alert("✅ "+d.message)).catch(e=>alert("❌ Error"));
+        }
+    }
+    
+    socket.on('update', (payload) => {
+        const { threshold, globalStats, accounts, harvestTime } = payload;
+        
+        // Harvest Timer
+        const diff = Math.max(0, harvestTime - Date.now());
+        const mins = Math.floor(diff / 60000);
+        const secs = Math.floor((diff % 60000) / 1000);
+        document.getElementById('harvest-timer').innerText = \`🌾 Harvest in: \${mins}:\${secs < 10 ? '0'+secs : secs}\`;
+
+        // Calculate History Stats
+        let wins30m = 0, losses30m = 0;
+        const timeLimit = Date.now() - (30 * 60 * 1000); 
+        accounts.forEach(acc => { acc.history.forEach(h => { if (h.closeTime > timeLimit) { if (h.pnl > 0) wins30m++; else losses30m++; }}); });
+        
+        // Global PnL
+        const pnlColor = globalStats.totalPnL >= 0 ? 'var(--green)' : 'var(--red)';
+        const pnlSign = globalStats.totalPnL >= 0 ? '+' : '';
+        const pnlHtml = \`<span class="global-pnl-box" style="color:\${pnlColor}">GLOBAL PNL: \${pnlSign}\${globalStats.totalPnL.toFixed(8)} USDT</span>\`;
+
+        document.getElementById('perf-stats').innerHTML = \`
+            \${pnlHtml}
+            <span style="font-size:13px; font-family:'JetBrains Mono'; font-weight:700;">
+                <span style="color:var(--green)">LONG: \${globalStats.longs}</span> | <span style="color:var(--red)">SHORT: \${globalStats.shorts}</span> 
+                &nbsp;<span style="color:#9ca3af">[30m: <span style="color:var(--green)">\${wins30m}W</span> <span style="color:var(--red)">\${losses30m}L</span>]</span>
+            </span>\`;
+
+        document.getElementById('app').innerHTML = accounts.map(acc => {
+            let rows = acc.history.map(h => {
+                const pnlColor = h.pnl >= 0 ? 'green' : 'red';
+                return \`<tr><td><div class="td-sym">\${h.symbol}</div></td><td><div style="font-weight:600">\${h.totalSize}</div></td><td><div>\${fmtPrice(h.openPrice)}</div></td><td class="td-pnl-val"><div class="\${pnlColor}">\${h.pnl.toFixed(4)}</div></td><td class="td-pnl-val \${pnlColor}">\${h.roi.toFixed(2)}%</td><td class="td-time"><div>\${fmtDate(h.closeTime)}</div></td></tr>\`;
+            }).join('');
+            if(rows === '') rows = '<tr><td colspan="6" style="text-align:center; padding:30px; color:var(--text-secondary);">No closed trades yet</td></tr>';
+            
+            const tradesToGo = Math.max(0, threshold - acc.sacrificeCounter);
+
+            return \`<div class="card"><div class="header"><div class="title">\${acc.id}</div><div class="tick">⚡ \${acc.tickDuration}ms</div></div>
+                <div class="stat-row"><span class="stat-label">Balance</span> <span class="val">\${parseFloat(acc.wallet.balance).toFixed(2)}</span></div>
+                <div class="stat-row"><span class="stat-label">Total PnL</span> <span class="val \${acc.wallet.totalUpnl>=0?'green':'red'}">\${acc.wallet.totalUpnl.toFixed(4)}</span></div>
+                <div class="stat-row"><span class="stat-label">Max Risk</span> <span class="val" style="color:\${acc.maxRisk>50?'var(--red)':'inherit'}">\${acc.maxRisk.toFixed(1)}%</span></div>
+                
+                <div class="sacrifice-alert">🔪 SCHEDULED SACRIFICE: Next Cut \${tradesToGo} trades to go before cut</div>
+                
+                <div class="history-container"><table><thead><tr><th>Coin</th><th>Size</th><th>Entry</th><th>PnL</th><th>ROI</th><th>Time</th></tr></thead><tbody>\${rows}</tbody></table></div>
+            </div>\`;
+        }).join('');
+    });
+</script></body></html>`;
+
+app.get('/', (req, res) => res.send(DASHBOARD_HTML));
+
+server.listen(PORT, async () => {
+    console.log(`\n=================================================`);
+    console.log(`🚀 BOT STARTED ON PORT ${PORT}`);
+    console.log(`=================================================\n`);
+    await publicExchange.loadMarkets().catch(e => console.log("⚠️ Public Market Load Warning"));
+    await Promise.all(accInstances.map(a => a.init()));
+    console.log('\n✅ Loop Started...');
+    mainLoop();
+});
