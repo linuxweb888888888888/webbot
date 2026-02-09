@@ -1,0 +1,774 @@
+/******************************************************************************************
+    ⚡ IRONCLAD PROFIT GUARD v4.8 (Per-Account Harvest Edition)
+    
+    SCENARIO: Multi-Account | Multi-Coin
+    RULESET: 
+      1. ABSOLUTELY NO CLOSING unless PnL is POSITIVE (covers fees).
+      2. Standard TP is DISABLED. Winners are held indefinitely until Harvest.
+      3. HARVEST: Every 1 minute, selects the HIGHEST ROI position PER ACCOUNT.
+      4. SAFETY: Double-checks PnL > 0 at the exact moment of execution.
+    
+    CHANGELOG v4.8:
+    1. HARVEST: Changed from Global Top 10 to Best-Per-Account.
+    2. TIMER: Harvest runs every 60 seconds.
+******************************************************************************************/
+
+const fs = require('fs');
+const dotenv = require('dotenv');
+const express = require('express');
+const http = require('http');
+const https = require('https'); 
+const { Server } = require('socket.io');
+const ccxt = require('ccxt');
+const minimist = require('minimist');
+
+// ================= CONFIGURATION =================
+const args = minimist(process.argv.slice(2));
+
+const rawCoinArg = args.coin || 'BTC ETH SOL XRP ADA DOGE LINK DOT 1000SATS PEPE LTC BCH AVAX MATIC ATOM NEAR UNI ALGO FIL VET ICP SAND AXS EGLD THETA XTZ EOS AAVE KSM OKB RUNE FTM GRT SNX CRV BAT ENJ ZIL 1INCH DASH CHZ SUSHI COMP YFI MKR';
+const COIN_LIST = rawCoinArg.toString().split(/[\s,]+/).filter(c => c).map(c => c.toUpperCase());
+const PORT = parseInt(args.port) || 3000;
+
+const CONFIG = {
+    // ❌ STANDARD TP DISABLED (Handled by Harvest Only)
+    TAKE_PROFIT_ROI: 99999,    
+    
+    STOP_LOSS_ROI: -0.1,       
+    LIQ_RISK_TRIGGER: 60,      
+    MAX_RISK_EXIT: 200,        
+    TARGET_RECOVERY_ROI: 35,   
+    LEVERAGE: 20,              
+    ENTRY_MULTIPLIER: 1,       
+    
+    // ⚡ HIGH SCALE SETTINGS ⚡
+    POLL_RATE: 6000,           
+    STAGGER_DELAY: 300,        
+    BALANCE_REFRESH_RATE: 60,  
+    HTTP_TIMEOUT: 12000,       
+    ORDER_DEBOUNCE_MS: 2000,   
+    RATE_LIMIT_PAUSE_MS: 30000,
+    
+    // ♻️ LOGIC REBOOT (Keeps bot alive)
+    LOGIC_REBOOT_INTERVAL_MS: 10 * 60 * 1000, 
+    
+    EST_FEE_RATE: 0.0006,      
+    MIN_PRICE_MOVE: 0.002,     
+    TP_CONFIRM_MS: 1000,       
+    SACRIFICE_THRESHOLD: 9999,   
+    
+    // 🌾 HARVEST SETTINGS (Modified: 1 Minute, Per Account)
+    HARVEST_INTERVAL_MS: 300 * 1000, // 1 Minute
+    HARVEST_MIN_ROI: 0.5 // Minimum ROI to be considered (Cover Fees)
+};
+
+// 🌍 GLOBAL STATE
+let GLOBAL_OPEN_LONGS = 0;
+let GLOBAL_OPEN_SHORTS = 0;
+let GLOBAL_API_PAUSE_UNTIL = 0; 
+let NEXT_HARVEST_TIME = Date.now() + CONFIG.HARVEST_INTERVAL_MS;
+let NEXT_LOGIC_REBOOT_TIME = Date.now() + CONFIG.LOGIC_REBOOT_INTERVAL_MS; 
+
+// ⚡ PERFORMANCE AGENT
+const httpsAgent = new https.Agent({ 
+    keepAlive: true, 
+    maxSockets: 32,            
+    keepAliveMsecs: 30000, 
+    timeout: CONFIG.HTTP_TIMEOUT 
+});
+
+// ================= UTILITIES =================
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+function parseEnvFile(filePath) {
+    try {
+        const content = fs.readFileSync(filePath);
+        const config = dotenv.parse(content);
+        if (!config.PHEMEX_KEY || !config.PHEMEX_SECRET) return { key: null, secret: null };
+        return { key: config.PHEMEX_KEY, secret: config.PHEMEX_SECRET };
+    } catch (e) { return { key: null, secret: null }; }
+}
+
+function calculateLiqRisk(pos, entry, mark, leverage) {
+    if (!entry || !mark) return 0;
+    let liqPrice = parseFloat(pos.liquidationPrice);
+    if (!liqPrice || liqPrice === 0) {
+        const mmr = 0.005;
+        liqPrice = pos.side === 'long' 
+            ? entry * (1 - (1 / leverage) + mmr) 
+            : entry * (1 + (1 / leverage) - mmr);
+    }
+    const distTotal = Math.abs(entry - liqPrice);
+    if (distTotal === 0) return 100;
+    const distToLiq = Math.abs(mark - liqPrice);
+    let risk = ((distTotal - distToLiq) / distTotal) * 100;
+    return Math.max(0, Math.min(100, risk));
+}
+
+function calculateRecoveryQty(side, currentPrice, currentEntry, currentQty, targetRoi, leverage) {
+    const roiDecimal = targetRoi / 100;
+    let targetAvgEntry = side === 'long' 
+        ? currentPrice / ((roiDecimal / leverage) + 1)
+        : currentPrice / (1 - (roiDecimal / leverage));
+    
+    if ((side === 'long' && targetAvgEntry >= currentPrice) || 
+        (side === 'short' && targetAvgEntry <= currentPrice)) return 0;
+    
+    const denom = Math.abs(targetAvgEntry - currentPrice);
+    if (denom < 0.00000001) return 0;
+    const numerator = currentQty * (currentEntry - targetAvgEntry);
+    return Math.abs(numerator / denom);
+}
+
+// ================= GLOBAL MARKET DATA MANAGER =================
+const publicExchange = new ccxt.phemex({
+    enableRateLimit: true, 
+    agent: httpsAgent,
+    timeout: CONFIG.HTTP_TIMEOUT,
+    options: { defaultType: 'swap' }
+});
+
+// ================= ACCOUNT CLASS =================
+
+class TradingAccount {
+    constructor(id, filename, creds) {
+        this.id = id;
+        this.name = filename;
+        this.isReady = false;
+        this.tickCounter = 0; 
+        this.forceSync = false; 
+        this.exchange = new ccxt.phemex({
+            apiKey: creds.key, secret: creds.secret, 
+            enableRateLimit: true,
+            agent: httpsAgent,
+            timeout: CONFIG.HTTP_TIMEOUT,
+            options: { defaultType: 'swap', adjustForTimeDifference: true } 
+        });
+        this.data = {
+            wallet: { balance: 0, equity: 0, totalUpnl: 0 },
+            activeCoinsCount: 0, maxRisk: 0, tickDuration: 0, 
+            sacrificeCounter: 0, 
+            coins: {}, history: [] 
+        };
+        this.symbols = {}; 
+        this.prevPositions = {}; 
+        this.retryUntil = 0; 
+    }
+
+    async init() {
+        try {
+            console.log(`[${this.id}] 📡 Loading Markets...`);
+            const markets = await this.exchange.loadMarkets();
+            const initPromises = COIN_LIST.map(async (coin) => {
+                const swapSymbol = Object.keys(markets).find(s => 
+                    markets[s].base === coin && markets[s].quote === 'USDT' && markets[s].linear === true
+                );
+                if (swapSymbol) {
+                    this.symbols[coin] = swapSymbol;
+                    const marketInfo = markets[swapSymbol];
+                    let minAmount = marketInfo.limits.amount.min || marketInfo.precision.amount || 1;
+                    
+                    try { await this.exchange.cancelAllOrders(swapSymbol); } catch(e) {}
+
+                    this.data.coins[coin] = {
+                        symbol: swapSymbol, 
+                        limits: { minAmount: parseFloat(minAmount) }, 
+                        market: { price: 0, markPrice: 0, bid: 0, ask: 0 },
+                        position: { qty: 0, entry: 0, upnl: 0, roi: 0, realRoi: 0, risk: 0, side: 'NONE' },
+                        bot: { 
+                            status: 'IDLE', lastAction: 0, 
+                            tpStart: 0, tpOrderId: null, tpLastPrice: 0, tpLastUpdate: 0,
+                            dcaOrderId: null, dcaLastPrice: 0, dcaLastUpdate: 0,
+                            entryOrderId: null, entryLastPrice: 0, entryLastUpdate: 0,
+                            slOrderId: null, slLastPrice: 0, slLastUpdate: 0,
+                            forceHarvest: false,
+                            isBusy: false,
+                            busyStart: 0 
+                        }
+                    };
+                    this.prevPositions[coin] = { qty: 0, entry: 0, side: 'NONE', openTime: 0 };
+                    try { await this.exchange.setLeverage(CONFIG.LEVERAGE, swapSymbol); } catch(err) {}
+                }
+            });
+            await Promise.all(initPromises);
+            this.isReady = true;
+            console.log(`[${this.id}] ✅ Initialized.`);
+        } catch (e) { console.error(`[${this.id}] 💀 Init Failed:`, e.message); }
+    }
+
+    // ♻️ SOFT REBOOT
+    performSoftReset() {
+        this.retryUntil = 0; 
+        this.forceSync = true; 
+        
+        Object.values(this.data.coins).forEach(c => {
+            c.bot.isBusy = false;
+            c.bot.busyStart = 0;
+            c.bot.status = 'IDLE';
+            c.bot.tpOrderId = null;
+            c.bot.slOrderId = null;
+            c.bot.dcaOrderId = null;
+            c.bot.entryOrderId = null;
+        });
+    }
+
+    async cancelOrderSafe(coinState, tag) {
+        const orderId = coinState.bot[`${tag}OrderId`];
+        if (!orderId) return false;
+
+        try {
+            await this.exchange.cancelOrder(orderId, coinState.symbol);
+            coinState.bot[`${tag}OrderId`] = null; 
+            return false; 
+        } catch (e) {
+            const msg = e.message.toLowerCase();
+            if (msg.includes('not found') || msg.includes('filled') || msg.includes('closed') || msg.includes('cancel')) {
+                coinState.bot[`${tag}OrderId`] = null;
+                return true; 
+            }
+            if (e instanceof ccxt.RateLimitExceeded || msg.includes('429') || msg.includes('too many requests')) {
+                console.warn(`[${this.id}] ⚠️ RATE LIMITED (Cancel)! Pausing 30s...`);
+                this.retryUntil = Date.now() + CONFIG.RATE_LIMIT_PAUSE_MS;
+            }
+            return false;
+        }
+    }
+
+    async closeAllPositions() {
+        if (!this.isReady) return;
+        console.log(`[${this.id}] 🚨 MANUAL CLOSE TRIGGERED!`);
+        try {
+            const knownSymbols = Object.values(this.symbols);
+            const positions = await this.exchange.fetchPositions(knownSymbols);
+            const activePositions = positions.filter(p => Math.abs(parseFloat(p.contracts || p.amount)) > 0);
+            
+            await Promise.all(activePositions.map(pos => {
+                const amount = Math.abs(parseFloat(pos.contracts || pos.amount));
+                const side = pos.side === 'long' ? 'sell' : 'buy'; 
+                return this.exchange.createOrder(pos.symbol, 'market', side, amount, undefined, {'reduceOnly': true})
+                    .then(() => console.log(`[${this.id}] 💥 Closed ${pos.symbol}`))
+                    .catch(err => console.error(`[${this.id}] ❌ Close Failed ${pos.symbol}: ${err.message}`));
+            }));
+
+            Object.values(this.data.coins).forEach(c => {
+                c.bot.status = 'IDLE'; 
+                c.bot.forceHarvest = false;
+                c.bot.isBusy = false;
+                c.bot.entryOrderId = null; c.bot.tpOrderId = null; c.bot.dcaOrderId = null; c.bot.slOrderId = null;
+            });
+            this.data.sacrificeCounter = 0; 
+            this.tickCounter = CONFIG.BALANCE_REFRESH_RATE; 
+        } catch (e) { console.error(`[${this.id}] Cleanup Error:`, e.message); }
+    }
+
+    async manageLimitChase(coinState, symbol, side, qty, targetPrice, orderTypeTag, params = {}) {
+        if (coinState.bot.isBusy) return;
+        if (Date.now() < this.retryUntil) return;
+
+        const orderIdKey = `${orderTypeTag}OrderId`;
+        const lastPriceKey = `${orderTypeTag}LastPrice`;
+        const lastUpdateKey = `${orderTypeTag}LastUpdate`;
+        
+        const safePrice = parseFloat(this.exchange.priceToPrecision(symbol, targetPrice));
+        const safeQty = parseFloat(this.exchange.amountToPrecision(symbol, qty));
+
+        if (safeQty <= 0) return;
+
+        if (coinState.bot[orderIdKey]) {
+            if (coinState.bot[lastUpdateKey] && (Date.now() - coinState.bot[lastUpdateKey] < CONFIG.ORDER_DEBOUNCE_MS)) {
+                return;
+            }
+        }
+
+        coinState.bot.isBusy = true; 
+        coinState.bot.busyStart = Date.now();
+
+        try {
+            if (coinState.bot[orderIdKey]) {
+                const currentOrderPrice = coinState.bot[lastPriceKey];
+                const drift = Math.abs(safePrice - currentOrderPrice);
+                const threshold = coinState.market.price * 0.0005; 
+
+                if (drift > threshold) {
+                    const wasFilled = await this.cancelOrderSafe(coinState, orderTypeTag);
+                    if (wasFilled) {
+                        coinState.bot.isBusy = false;
+                        return; 
+                    }
+                }
+            }
+
+            if (!coinState.bot[orderIdKey]) {
+                const order = await this.exchange.createOrder(symbol, 'limit', side, safeQty, safePrice, params);
+                coinState.bot[orderIdKey] = order.id;
+                coinState.bot[lastPriceKey] = safePrice;
+                coinState.bot[lastUpdateKey] = Date.now();
+                coinState.bot.status = `${orderTypeTag.toUpperCase()}_CHASE`;
+                if(orderTypeTag === 'entry') coinState.bot.openTime = Date.now();
+                console.log(`[${this.id}] ✅ Order Placed: ${symbol} ${side} @ ${safePrice}`);
+            }
+        } catch (e) {
+            console.error(`[${this.id}] ⚠️ Order Error (${symbol}): ${e.message}`);
+            
+            const msg = e.message.toLowerCase();
+            if (e instanceof ccxt.RateLimitExceeded || msg.includes('429') || msg.includes('too many requests')) {
+                console.warn(`[${this.id}] 🚨 RATE LIMIT HIT! Pausing account for 30s...`);
+                this.retryUntil = Date.now() + CONFIG.RATE_LIMIT_PAUSE_MS;
+            }
+            else if(msg.includes('insufficient') || msg.includes('invalid') || msg.includes('minimum')) {
+                coinState.bot[orderIdKey] = null;
+            }
+        } finally {
+            coinState.bot.isBusy = false; 
+        }
+    }
+
+    async update(sharedTickers) {
+        if (!this.isReady) return;
+        if (Date.now() < this.retryUntil) return;
+
+        const startTick = Date.now();
+        this.tickCounter++;
+
+        try {
+            const symbolsToFetch = Object.values(this.symbols);
+            if(symbolsToFetch.length === 0) return;
+
+            let positionsData = null;
+            try {
+                positionsData = await this.exchange.fetchPositions(symbolsToFetch);
+            } catch (e) {
+                if (e.message.includes('429') || e.message.toLowerCase().includes('too many requests')) {
+                    this.retryUntil = Date.now() + CONFIG.RATE_LIMIT_PAUSE_MS;
+                    console.warn(`[${this.id}] ⚠️ 429 on Position Fetch! Pausing 30s...`);
+                }
+                return; 
+            } 
+            if (!Array.isArray(positionsData)) return;
+
+            // 🧹 SYNC ORDERS (Runs on Reboot or standard interval)
+            if (this.tickCounter >= 20 || this.forceSync) {
+                this.forceSync = false; 
+                
+                this.exchange.fetchBalance({ type: 'swap', code: 'USDT' })
+                    .then(bd => { this.data.wallet.balance = parseFloat(bd.USDT?.total || bd.total?.USDT || 0); })
+                    .catch(() => {});
+                
+                try {
+                    const openOrders = await this.exchange.fetchOpenOrders();
+                    const liveOrderIds = openOrders.map(o => o.id);
+                    
+                    Object.values(this.data.coins).forEach(c => {
+                        if (c.bot.tpOrderId && !liveOrderIds.includes(c.bot.tpOrderId)) c.bot.tpOrderId = null;
+                        if (c.bot.slOrderId && !liveOrderIds.includes(c.bot.slOrderId)) c.bot.slOrderId = null;
+                        if (c.bot.dcaOrderId && !liveOrderIds.includes(c.bot.dcaOrderId)) c.bot.dcaOrderId = null;
+                    });
+                } catch(e) { }
+                this.tickCounter = 0;
+            }
+            
+            this.data.wallet.totalUpnl = 0;
+            this.data.activeCoinsCount = 0;
+            this.data.maxRisk = 0;
+
+            const posMap = new Map();
+            positionsData.forEach(p => { if (Object.values(this.symbols).includes(p.symbol)) posMap.set(p.symbol, p); });
+            
+            await Promise.all(COIN_LIST.map(async (coin) => {
+                const coinState = this.data.coins[coin];
+                if (!coinState) return;
+                
+                // 🔐 WATCHDOG
+                if (coinState.bot.isBusy && (Date.now() - coinState.bot.busyStart > 30000)) {
+                    coinState.bot.isBusy = false;
+                }
+                
+                const SYMBOL = coinState.symbol;
+                const ticker = sharedTickers[SYMBOL];
+                if (ticker) {
+                    coinState.market.price = ticker.last;
+                    coinState.market.markPrice = ticker.info.markPrice ? parseFloat(ticker.info.markPrice) : ticker.last;
+                    coinState.market.bid = ticker.bid || ticker.last;
+                    coinState.market.ask = ticker.ask || ticker.last;
+                }
+
+                const pos = posMap.get(SYMBOL);
+                const hasPos = pos && parseFloat(pos.contracts || pos.amount) > (coinState.limits.minAmount * 0.1); 
+                const prevPos = this.prevPositions[coin];
+
+                if (hasPos) {
+                    const rawSize = Math.abs(parseFloat(pos.contracts || pos.amount));
+                    
+                    if (prevPos.qty === 0) {
+                        coinState.bot.openTime = Date.now();
+                        coinState.bot.status = 'HOLDING'; 
+                        if (coinState.bot.entryOrderId) await this.cancelOrderSafe(coinState, 'entry');
+                    }
+                    
+                    coinState.position.qty = rawSize;
+                    coinState.position.entry = parseFloat(pos.entryPrice);
+                    coinState.position.side = pos.side;
+
+                    let exitPrice = pos.side === 'long' ? coinState.market.bid : coinState.market.ask;
+                    let uPnL = pos.side === 'long' 
+                        ? (exitPrice - coinState.position.entry) * rawSize 
+                        : (coinState.position.entry - exitPrice) * rawSize;
+                    
+                    const marginUsed = (rawSize * coinState.position.entry) / CONFIG.LEVERAGE;
+                    let markPnL = pos.side === 'long' 
+                        ? (coinState.market.markPrice - coinState.position.entry) * rawSize 
+                        : (coinState.position.entry - coinState.market.markPrice) * rawSize;
+
+                    coinState.position.roi = marginUsed > 0 ? (markPnL / marginUsed) * 100 : 0;
+                    coinState.position.realRoi = marginUsed > 0 ? (uPnL / marginUsed) * 100 : 0;
+                    coinState.position.upnl = uPnL;
+                    coinState.position.risk = calculateLiqRisk(pos, coinState.position.entry, coinState.market.markPrice, CONFIG.LEVERAGE);
+
+                    this.data.wallet.totalUpnl += uPnL;
+                    this.data.activeCoinsCount++;
+                    if(coinState.position.risk > this.data.maxRisk) this.data.maxRisk = coinState.position.risk;
+
+                    this.prevPositions[coin] = { qty: rawSize, entry: coinState.position.entry, side: pos.side, openTime: coinState.bot.openTime || Date.now() };
+                } else {
+                    if (prevPos.qty > 0) {
+                        const closePrice = (prevPos.side === 'long') ? coinState.market.bid : coinState.market.ask;
+                        this.recordHistory(coin, prevPos, closePrice);
+                        
+                        await this.cancelOrderSafe(coinState, 'tp');
+                        await this.cancelOrderSafe(coinState, 'dca');
+                        await this.cancelOrderSafe(coinState, 'sl');
+                        await this.cancelOrderSafe(coinState, 'entry');
+
+                        coinState.bot.forceHarvest = false; 
+                        this.tickCounter = 1000; // Force sync next tick
+                    }
+                    coinState.position.qty = 0; coinState.position.upnl = 0; coinState.position.roi = 0; 
+                    coinState.position.realRoi = 0; coinState.position.risk = 0; coinState.position.side = 'NONE';
+                    coinState.bot.status = 'IDLE';
+                    coinState.bot.tpStart = 0; 
+                    this.prevPositions[coin] = { qty: 0, entry: 0, side: 'NONE', openTime: 0 };
+                }
+                
+                await this.executeLogic(coin, coinState, SYMBOL);
+            }));
+
+            this.data.wallet.equity = this.data.wallet.balance + this.data.wallet.totalUpnl;
+            this.data.tickDuration = Date.now() - startTick;
+        } catch (e) { console.error(`[${this.id}] Cycle Error:`, e.message); }
+    }
+
+    recordHistory(coin, prevPos, closePrice) {
+        let pnl = 0;
+        let sideLabel = prevPos.side === 'long' ? `LONG ${coin}` : `SHORT ${coin}`;
+        if (prevPos.side === 'long') pnl = (closePrice - prevPos.entry) * prevPos.qty;
+        else pnl = (prevPos.entry - closePrice) * prevPos.qty;
+
+        const entryVal = prevPos.qty * prevPos.entry;
+        const estFee = (entryVal + (prevPos.qty * closePrice)) * CONFIG.EST_FEE_RATE;
+        const netPnl = pnl - estFee;
+        const margin = entryVal / CONFIG.LEVERAGE;
+        const roi = margin > 0 ? (netPnl / margin) * 100 : 0;
+
+        if (netPnl > 0) {
+            this.data.sacrificeCounter++;
+            console.log(`[${this.id}] 🪙 Profitable Trade! Progress: ${this.data.sacrificeCounter} / ${CONFIG.SACRIFICE_THRESHOLD}`);
+        }
+        this.data.history.unshift({
+            symbol: `${coin}USDT`, marginType: 'Cross', totalSize: sideLabel,
+            openPrice: prevPos.entry, closePrice: closePrice, pnl: netPnl, roi: roi,
+            openTime: prevPos.openTime, closeTime: Date.now()
+        });
+        if (this.data.history.length > 20) this.data.history.pop();
+    }
+
+    async executeLogic(coin, state, symbol) {
+        if (Date.now() < this.retryUntil) return;
+        if (!state.market.price || state.market.price === 0) return;
+        if (state.bot.isBusy) return;
+
+        // --- ENTRY LOGIC ---
+        if (state.position.qty === 0) {
+            let side = 'buy'; 
+            if (GLOBAL_OPEN_SHORTS < GLOBAL_OPEN_LONGS) side = 'sell'; 
+            else if (GLOBAL_OPEN_LONGS < GLOBAL_OPEN_SHORTS) side = 'buy'; 
+            else side = (COIN_LIST.indexOf(coin) % 2 === 0) ? 'buy' : 'sell';
+
+            const limitPrice = side === 'buy' ? state.market.bid : state.market.ask;
+            const rawQty = state.limits.minAmount * CONFIG.ENTRY_MULTIPLIER;
+            await this.manageLimitChase(state, symbol, side, rawQty, limitPrice, 'entry');
+        } 
+        // --- EXIT LOGIC ---
+        else {
+            const isLong = state.position.side === 'long';
+            const exitSide = isLong ? 'sell' : 'buy';
+            const exitPrice = isLong ? state.market.bid : state.market.ask;
+
+            let doTakeProfit = false;
+            
+            // ❌ STANDARD TP IS DISABLED. WE ONLY USE HARVEST.
+
+            // ✅ HARVEST CHECK
+            if (state.bot.forceHarvest === true) {
+                // 🛡️ LAST-SECOND PROFIT GUARD 🛡️
+                // Ensure we are STILL profitable right before execution.
+                if (state.position.upnl > 0 && state.position.realRoi > 0) {
+                    doTakeProfit = true;
+                } else {
+                    // Price crashed since harvest selection? ABORT.
+                    console.log(`[${this.id}] 🛡️ HARVEST ABORTED: ${symbol} is no longer profitable (PnL: ${state.position.upnl.toFixed(4)})`);
+                    state.bot.forceHarvest = false;
+                }
+            }
+
+            // --- EXECUTE TP (Only if Harvested & Profitable) ---
+            if (doTakeProfit) {
+                if (state.bot.slOrderId) await this.cancelOrderSafe(state, 'sl');
+                if (state.bot.dcaOrderId) await this.cancelOrderSafe(state, 'dca');
+                await this.manageLimitChase(state, symbol, exitSide, state.position.qty, exitPrice, 'tp', {'reduceOnly': true});
+                return; 
+            } else {
+                if (state.bot.tpOrderId) {
+                    await this.cancelOrderSafe(state, 'tp');
+                    state.bot.status = 'HOLDING';
+                }
+            }
+
+            // --- EXECUTE SL (Protection stays active) ---
+            if (state.position.realRoi <= CONFIG.STOP_LOSS_ROI) {
+                if (state.bot.tpOrderId) await this.cancelOrderSafe(state, 'tp');
+                if (state.bot.dcaOrderId) await this.cancelOrderSafe(state, 'dca');
+                await this.manageLimitChase(state, symbol, exitSide, state.position.qty, exitPrice, 'sl', {'reduceOnly': true});
+                return;
+            } else {
+                if (state.bot.slOrderId) {
+                    await this.cancelOrderSafe(state, 'sl');
+                    state.bot.status = 'HOLDING';
+                }
+            }
+
+            // --- EXECUTE DCA ---
+            if (state.position.risk >= CONFIG.LIQ_RISK_TRIGGER && state.position.risk <= CONFIG.MAX_RISK_EXIT) {
+                const needed = calculateRecoveryQty(state.position.side, state.market.markPrice, state.position.entry, state.position.qty, CONFIG.TARGET_RECOVERY_ROI, CONFIG.LEVERAGE);
+                let qty = Math.min(needed, state.position.qty * 1.5); 
+                if(qty < state.limits.minAmount) qty = state.limits.minAmount;
+                const dcaSide = isLong ? 'buy' : 'sell'; 
+                const dcaPrice = isLong ? state.market.bid : state.market.ask;
+                
+                await this.manageLimitChase(state, symbol, dcaSide, qty, dcaPrice, 'dca');
+            } else {
+                if (state.bot.dcaOrderId) {
+                    await this.cancelOrderSafe(state, 'dca');
+                }
+            }
+        }
+    }
+}
+
+// ================= INITIALIZATION =================
+const accInstances = [];
+const envFiles = fs.readdirSync(process.cwd()).filter(fn => fn.startsWith('.env') && !fn.endsWith('example'));
+if (envFiles.length === 0) { console.error("❌ No .env files found!"); process.exit(1); }
+envFiles.forEach((filename) => {
+    const id = filename.split('.')[2] || 'Main';
+    const creds = parseEnvFile(filename);
+    if(creds.key && creds.secret) { accInstances.push(new TradingAccount(id.toUpperCase(), filename, creds)); }
+});
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: "*" } });
+
+app.post('/close-all', async (req, res) => {
+    console.log("\n🛑 MANUAL CLOSE COMMAND RECEIVED 🛑");
+    await Promise.all(accInstances.map(a => a.closeAllPositions()));
+    res.json({ success: true, message: "Close command sent to all accounts." });
+});
+
+async function mainLoop() {
+    try {
+        const loopStart = Date.now();
+        process.stdout.write('.'); 
+
+        const allSymbols = [...new Set(accInstances.flatMap(acc => Object.values(acc.symbols)))];
+        let sharedTickers = {};
+        
+        // 🔒 GLOBAL RATE LIMIT CHECK
+        if (allSymbols.length > 0 && Date.now() > GLOBAL_API_PAUSE_UNTIL) {
+            try { 
+                sharedTickers = await publicExchange.fetchTickers(); 
+            } catch (e) {
+                if(e.message.includes('429') || e.message.toLowerCase().includes('too many requests')) {
+                    console.warn("\n⚠️ PUBLIC API RATE LIMIT! Pausing tickers 30s...");
+                    GLOBAL_API_PAUSE_UNTIL = Date.now() + 30000;
+                }
+            }
+        }
+
+        // ♻️ CHECK FOR LOGIC REBOOT ♻️
+        if (Date.now() >= NEXT_LOGIC_REBOOT_TIME) {
+            console.log("\n\n♻️ ======================================");
+            console.log("♻️ AUTO-REBOOTING LOGIC (CLEARING STUCK ORDERS)");
+            console.log("♻️ ======================================\n");
+            
+            accInstances.forEach(acc => acc.performSoftReset());
+            NEXT_LOGIC_REBOOT_TIME = Date.now() + CONFIG.LOGIC_REBOOT_INTERVAL_MS;
+        }
+
+        for (const acc of accInstances) {
+            await acc.update(sharedTickers);
+            await sleep(CONFIG.STAGGER_DELAY); 
+        }
+        
+        let tLongs = 0, tShorts = 0;
+        let tGlobalPnL = 0; 
+        
+        for (const acc of accInstances) {
+            tGlobalPnL += acc.data.wallet.totalUpnl;
+            Object.values(acc.data.coins).forEach(c => {
+                if (c.position.qty > 0) {
+                    if (c.position.side === 'long') tLongs++; else tShorts++;
+                }
+            });
+
+            // 🩸 SACRIFICE LOGIC (Closing Losers Only)
+            if (acc.data.sacrificeCounter >= CONFIG.SACRIFICE_THRESHOLD) {
+                console.log(`\n🔪 [${acc.id}] SACRIFICE THRESHOLD REACHED.`);
+                let worstPos = null; let worstRoi = 1000; 
+                Object.values(acc.data.coins).forEach(coin => {
+                    if (coin.position.qty > 0 && coin.position.roi < worstRoi) {
+                        worstRoi = coin.position.roi; worstPos = coin;
+                    }
+                });
+
+                if (worstPos) {
+                    console.log(`💀 SACRIFICING: ${worstPos.symbol} (ROI: ${worstRoi.toFixed(2)}%)`);
+                    try {
+                        await acc.exchange.cancelAllOrders(worstPos.symbol);
+                        const side = worstPos.position.side === 'long' ? 'sell' : 'buy';
+                        await acc.exchange.createOrder(worstPos.symbol, 'market', side, worstPos.position.qty, undefined, {'reduceOnly': true});
+                        console.log(`✅ SACRIFICE COMPLETE`);
+                    } catch(e) { console.error(`❌ Sacrifice Failed: ${e.message}`); }
+                }
+                acc.data.sacrificeCounter = 0;
+            }
+        }
+        
+        GLOBAL_OPEN_LONGS = tLongs; GLOBAL_OPEN_SHORTS = tShorts;
+        
+        try {
+            io.emit('update', {
+                threshold: CONFIG.SACRIFICE_THRESHOLD,
+                harvestTime: NEXT_HARVEST_TIME,
+                globalStats: { longs: GLOBAL_OPEN_LONGS, shorts: GLOBAL_OPEN_SHORTS, totalPnL: tGlobalPnL },
+                accounts: accInstances.map(a => ({ id: a.id, name: a.name, ...a.data }))
+            });
+        } catch(err) { console.error("Socket Emit Error:", err.message); }
+
+    } catch (e) { console.error("❌ MAIN LOOP ERROR:", e.message); }
+    setTimeout(mainLoop, CONFIG.POLL_RATE);
+}
+
+// ⏳ HARVEST TIMER (Every 1 Minute - Per Account Best ROI)
+setInterval(() => {
+    const now = Date.now();
+    if (now >= NEXT_HARVEST_TIME) {
+        NEXT_HARVEST_TIME = now + CONFIG.HARVEST_INTERVAL_MS;
+        console.log("\n🌾 HARVEST TIME! Scanning Best ROI Per Account (1 Min Interval)...");
+        
+        // Iterate through every account individually
+        for (const acc of accInstances) {
+            let bestPos = null;
+            let maxRoi = -999999; // Start low to find the highest
+
+            Object.values(acc.data.coins).forEach(c => {
+                // ✅ FILTER: Active, Profitable (uPnL > 0), ROI > Min, Not already busy/harvesting
+                if (c.position.qty > 0 && 
+                    c.position.upnl > 0 && 
+                    c.position.roi >= CONFIG.HARVEST_MIN_ROI && 
+                    !c.bot.forceHarvest) { 
+                    
+                    // Check if this is the best ROI for this specific account
+                    if (c.position.roi > maxRoi) {
+                        maxRoi = c.position.roi;
+                        bestPos = c;
+                    }
+                }
+            });
+
+            // If we found a winner for this account, trigger the harvest
+            if (bestPos) {
+                console.log(`🌟 [${acc.id}] Harvesting BEST: ${bestPos.symbol} @ ${maxRoi.toFixed(2)}% (PnL: ${bestPos.position.upnl.toFixed(4)})`);
+                bestPos.bot.forceHarvest = true; 
+            } else {
+                // Optional: Log that this account had nothing to harvest
+                // console.log(`   😴 [${acc.id}] No harvest candidates.`);
+            }
+        }
+    }
+}, 1000); 
+
+process.on('uncaughtException', (err) => { console.error('🔥 UNCAUGHT EXCEPTION:', err); });
+
+// ================= DASHBOARD =================
+const DASHBOARD_HTML = `
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>⚡ Bot v4.8</title>
+<script src="/socket.io/socket.io.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+    :root { --bg: #0f172a; --card: #1e293b; --text-primary: #f8fafc; --text-secondary: #94a3b8; --green: #10b981; --red: #ef4444; --border: #334155; }
+    body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text-primary); padding: 20px; font-size: 13px; margin: 0; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(400px, 1fr)); gap: 20px; }
+    .card { background: var(--card); border-radius: 8px; padding: 20px; border: 1px solid var(--border); }
+    .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; border-bottom: 1px solid var(--border); padding-bottom: 10px; }
+    .title { font-weight: 700; font-size: 15px; color: #fff; }
+    .stat-row { display: flex; justify-content: space-between; margin-bottom: 6px; font-size: 13px; }
+    .val { font-family: 'JetBrains Mono'; font-weight: 700; }
+    .green { color: var(--green); } .red { color: var(--red); }
+    table { width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 12px; }
+    th { text-align: left; color: var(--text-secondary); padding: 6px; border-bottom: 1px solid var(--border); }
+    td { padding: 8px 6px; border-bottom: 1px solid var(--border); color: #ccc; }
+    .nav { background: var(--card); padding: 15px; border-radius: 8px; margin-bottom: 20px; border: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+    .btn-panic { background: #7f1d1d; color: #fca5a5; border: 1px solid #991b1b; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: 600; }
+    .harvest-badge { background: #78350f; color: #fcd34d; padding: 4px 8px; border-radius: 4px; font-size: 11px; border: 1px solid #b45309; }
+</style>
+</head><body>
+<div class="nav">
+    <div>
+        <h2 style="margin:0; font-size:18px;">⚡ Ironclad Guard v4.8 <span id="harvest-timer" class="harvest-badge">Target: --:--</span></h2>
+        <div id="global-stats" style="margin-top:5px; font-family:'JetBrains Mono'; font-size:12px; color:var(--text-secondary)">Connecting...</div>
+    </div>
+    <button class="btn-panic" onclick="closeAllPositions()">🚨 CLOSE ALL</button>
+</div>
+<div class="grid" id="app"></div>
+<script>
+    const socket = io();
+    function fmt(n) { return parseFloat(n).toFixed(2); }
+    function closeAllPositions() { if(confirm("⚠️ CLOSE ALL POSITIONS?")) fetch('/close-all', { method: 'POST' }); }
+    socket.on('update', (d) => {
+        const { globalStats, accounts, harvestTime, threshold } = d;
+        const diff = Math.max(0, harvestTime - Date.now());
+        const mins = Math.floor(diff/60000); const secs = Math.floor((diff%60000)/1000);
+        document.getElementById('harvest-timer').innerText = \`Harvest: \${mins}:\${secs<10?'0'+secs:secs}\`;
+        
+        document.getElementById('global-stats').innerHTML = \`PnL: <span class="\${globalStats.totalPnL>=0?'green':'red'}">\${globalStats.totalPnL.toFixed(4)}</span> | L: \${globalStats.longs} S: \${globalStats.shorts}\`;
+
+        document.getElementById('app').innerHTML = accounts.map(acc => {
+            const rows = acc.history.map(h => \`<tr><td>\${h.symbol}</td><td>\${h.totalSize.includes('LONG')?'L':'S'}</td><td class="\${h.pnl>=0?'green':'red'}">\${h.pnl.toFixed(4)}</td><td>\${h.roi.toFixed(1)}%</td></tr>\`).join('');
+            return \`<div class="card"><div class="header"><div class="title">\${acc.id}</div><div style="font-size:11px">⚡ \${acc.tickDuration}ms</div></div>
+            <div class="stat-row"><span>Equity</span><span class="val">\${fmt(acc.wallet.equity)}</span></div>
+            <div class="stat-row"><span>Unrealized</span><span class="val \${acc.wallet.totalUpnl>=0?'green':'red'}">\${fmt(acc.wallet.totalUpnl)}</span></div>
+            <div class="stat-row"><span>Sacrifice</span><span class="val">\${acc.sacrificeCounter} / \${threshold}</span></div>
+            <div style="max-height:200px; overflow-y:auto"><table><thead><tr><th>Sym</th><th>Side</th><th>PnL</th><th>ROI</th></tr></thead><tbody>\${rows}</tbody></table></div></div>\`;
+        }).join('');
+    });
+</script></body></html>`;
+
+app.get('/', (req, res) => res.send(DASHBOARD_HTML));
+
+server.listen(PORT, async () => {
+    console.log(`\n✅ BOT STARTED PORT: ${PORT}`);
+    await publicExchange.loadMarkets().catch(() => {});
+    await Promise.all(accInstances.map(a => a.init()));
+    console.log('\n🚀 LOOP STARTED...');
+    mainLoop();
+});
