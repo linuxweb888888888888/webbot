@@ -1,0 +1,1969 @@
+/**
+ * PHEMEX ULTIMATE - HYBRID EDITION (v46.21 - LOCAL REAL HISTORY)
+ * SPECIAL EDITION: HITBTC CROSS FUTURES
+ * 
+ * FIXES:
+ * 1. "Infinite Buys": Fixed Symbol Matching in fetchPositions.
+ * 2. Logic: Strict Local PnL + Batch Tickers.
+ * 3. REAL MODE HISTORY: 
+ *    - Disabled fetching closed trades from HitBTC API.
+ *    - Closed trades (Bot or Manual UI Close) are now saved locally to DB.
+ *    - Realized PnL is calculated locally.
+ * 4. FIX: PnL/ROI Zero Issue (Switched to Bid/Ask pricing for closing calculations).
+ * 5. UI: Added Margin Used, Free Margin, and Max Margin stats.
+ * 6. VIRTUAL FIX: Virtual Client now uses REAL Market Limits (Min Qty) via publicClient.
+ * 7. LEVERAGE CAP: Auto-adjust leverage if coin max < requested leverage (Virtual & Real).
+ * 8. UI UPDATE: Added Reset Buttons for PnL, History, and Max Margin.
+ */
+
+const express = require('express');
+const http = require('http');
+const https = require('https'); 
+const socketIo = require('socket.io');
+const ccxt = require('ccxt');
+const session = require('express-session');
+const bodyParser = require('body-parser');
+const crypto = require('crypto');
+const mongoose = require('mongoose'); 
+
+// ==========================================
+// 1. CONFIGURATION
+// ==========================================
+const PORT = process.env.PORT || 3000;
+const SESSION_SECRET = 'hitbtc-ultimate-secret-v45';
+
+// 🔴 MONGODB CONNECTION STRING
+const MONGO_URI = 'mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@cluster0.vsmsbjh.mongodb.net/?appName=Cluster0';
+
+const NEWS_API_KEY = '5b69e4d348ad436ca832910872c7d663'; 
+const STARTING_BALANCE = 1000.00; 
+
+// CURRENCY RATES (Base: USDT)
+const CURRENCIES = {
+    'USD': { rate: 1.0, symbol: '$' },
+    'GBP': { rate: 0.79, symbol: '£' },
+    'EUR': { rate: 0.93, symbol: '€' },
+    'ZAR': { rate: 19.0, symbol: 'R' }
+};
+
+// TRADING SETTINGS
+const MAINTENANCE_MARGIN_RATE = 0.005; 
+const TAKER_FEE_RATE = 0.0006;         
+const SLIPPAGE_RATE = 0.0002;          
+
+const args = process.argv.slice(2);
+const coinArg = args.find(a => a.startsWith('--coin='));
+let customPairs = [];
+
+if (coinArg) {
+    const rawValue = coinArg.split('=')[1];
+    if (rawValue) {
+        const rawCoins = rawValue.split(/[\s,]+/).filter(c => c.trim().length > 0);
+        customPairs = rawCoins.map(c => {
+            let pair = c.trim();
+            if (!pair.includes('/') && !pair.includes(':')) {
+                pair = `${pair.toUpperCase()}/USDT:USDT`;
+            }
+            return pair;
+        });
+    }
+}
+
+// CCXT Unified Symbols for HitBTC Derivatives
+const DEFAULT_PAIRS = [
+    'BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'XRP/USDT:USDT', 
+    'LINK/USDT:USDT', 'DOGE/USDT:USDT', 'PEPE/USDT:USDT', 'SHIB/USDT:USDT', 
+    'ADA/USDT:USDT', 'AVAX/USDT:USDT', 'EOS/USDT:USDT', 'LTC/USDT:USDT', 'ATOM/USDT:USDT'
+];
+
+const SUPPORTED_PAIRS = customPairs.length > 0 ? customPairs : DEFAULT_PAIRS;
+
+// RAW GLOBAL TICKER STORE (Direct from CCXT)
+let GLOBAL_TICKERS = {};
+
+// GLOBAL NEWS CACHE
+let newsCache = [];
+let lastNewsFetch = 0;
+
+// ==========================================
+// 1.1 CLOUD PERSISTENCE LAYER (MongoDB)
+// ==========================================
+let users = [];
+let analytics = {
+    pageViews: [],
+    clicks: [],
+    registrations: 0,
+    botStarts: 0
+};
+
+// Mongoose Schemas
+const UserSchema = new mongoose.Schema({
+    id: { type: String, unique: true },
+    username: String,
+    password: String,
+    currency: String,
+    mode: String,
+    realKeys: Object,
+    bot: Object,
+    virtual: Object,
+    real: Object // Added to store real local history
+}, { strict: false });
+
+const AnalyticsSchema = new mongoose.Schema({
+    id: { type: String, default: 'global_stats' },
+    data: Object
+}, { strict: false });
+
+const UserModel = mongoose.model('User', UserSchema);
+const AnalyticsModel = mongoose.model('Analytics', AnalyticsSchema);
+
+async function loadDatabase() {
+    try {
+        const cloudUsers = await UserModel.find({});
+        if (cloudUsers.length > 0) {
+            users = cloudUsers.map(u => {
+                let userObj = u.toObject();
+                if (!userObj.virtual) userObj.virtual = {};
+                if (!userObj.virtual.positions) userObj.virtual.positions = {};
+                if (!userObj.virtual.closedTrades) userObj.virtual.closedTrades = [];
+                
+                // Init Real Local History if missing
+                if (!userObj.real) userObj.real = {};
+                if (!userObj.real.closedTrades) userObj.real.closedTrades = [];
+
+                userObj.client = null;
+                userObj.realClient = null;
+                return userObj;
+            });
+            console.log(`📂 DB LOADED: ${users.length} users retrieved.`);
+        }
+        const cloudAnalytics = await AnalyticsModel.findOne({ id: 'global_stats' });
+        if (cloudAnalytics && cloudAnalytics.data) {
+            analytics = cloudAnalytics.data;
+        }
+    } catch (e) {
+        console.log("⚠️ DB Load Error:", e.message);
+    }
+}
+
+async function saveDatabase() {
+    try {
+        for (const user of users) {
+            const { client, realClient, _id, ...cleanUser } = user;
+            await UserModel.findOneAndUpdate({ id: user.id }, cleanUser, { upsert: true });
+        }
+        await AnalyticsModel.findOneAndUpdate({ id: 'global_stats' }, { data: analytics }, { upsert: true });
+    } catch (e) {
+        console.error("❌ Cloud Save Error:", e.message);
+    }
+}
+
+// Global Public Client (HitBTC)
+const publicClient = new ccxt.hitbtc({ 
+    enableRateLimit: true,
+    timeout: 60000, 
+    options: { defaultType: 'swap' } 
+});
+
+// ==========================================
+// 2. REAL CLIENT WRAPPER (HitBTC ADAPTER - MANUAL FETCH)
+// ==========================================
+class RealClientWrapper {
+    constructor(apiKey, secret) {
+        this.apiKey = apiKey; 
+        this.secret = secret; 
+        this.parentUser = null; // Reference to user for saving history
+        this.ccxt = new ccxt.hitbtc({
+            apiKey: apiKey,
+            secret: secret,
+            enableRateLimit: true,
+            timeout: 60000,
+            options: { defaultType: 'swap' } 
+        });
+        this.maxMarginUsed = 0; 
+        this.marketsLoaded = false;
+    }
+
+    // --- HELPER: Translate Bot Symbol (BTC/USDT:USDT) to Raw (BTCUSDT) ---
+    getRawSymbol(botSymbol) {
+        if (!botSymbol) return '';
+        return botSymbol.replace(':USDT', '').replace('/', '');
+    }
+
+    // --- MANUAL REQUEST HELPER (GET) ---
+    async rawRequest(path) {
+        return new Promise((resolve, reject) => {
+            const auth = 'Basic ' + Buffer.from(this.apiKey + ':' + this.secret).toString('base64');
+            const options = {
+                hostname: 'api.hitbtc.com',
+                path: path,
+                method: 'GET',
+                headers: {
+                    'Authorization': auth,
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'NodeJS/1.0'
+                }
+            };
+
+            const req = https.request(options, (res) => {
+                let data = '';
+                res.on('data', (chunk) => { data += chunk; });
+                res.on('end', () => {
+                    try {
+                        const parsed = JSON.parse(data);
+                        resolve(parsed);
+                    } catch (e) {
+                        console.error("[HitBTC] JSON Parse Error:", e.message);
+                        resolve([]); 
+                    }
+                });
+            });
+
+            req.on('error', (e) => {
+                console.error("[HitBTC] Request Error:", e.message);
+                resolve([]);
+            });
+            req.end();
+        });
+    }
+
+    // --- MANUAL DELETE REQUEST HELPER (FOR CLOSING POSITIONS) ---
+    async rawDeleteRequest(path) {
+        return new Promise((resolve, reject) => {
+            const auth = 'Basic ' + Buffer.from(this.apiKey + ':' + this.secret).toString('base64');
+            const options = {
+                hostname: 'api.hitbtc.com',
+                path: path,
+                method: 'DELETE',
+                headers: {
+                    'Authorization': auth,
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'NodeJS/1.0'
+                }
+            };
+
+            const req = https.request(options, (res) => {
+                let data = '';
+                res.on('data', (chunk) => { data += chunk; });
+                res.on('end', () => {
+                    try {
+                        if(!data) return resolve({ success: true });
+                        const parsed = JSON.parse(data);
+                        resolve(parsed);
+                    } catch (e) {
+                        resolve({ success: true });
+                    }
+                });
+            });
+
+            req.on('error', (e) => {
+                console.error("[HitBTC] DELETE Request Error:", e.message);
+                resolve({});
+            });
+            req.end();
+        });
+    }
+
+    // --- MANUAL POST REQUEST HELPER (FOR LEVERAGE) ---
+    async rawPostRequest(path, bodyStr) {
+        return new Promise((resolve, reject) => {
+            const auth = 'Basic ' + Buffer.from(this.apiKey + ':' + this.secret).toString('base64');
+            const options = {
+                hostname: 'api.hitbtc.com',
+                path: path,
+                method: 'POST',
+                headers: {
+                    'Authorization': auth,
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Content-Length': Buffer.byteLength(bodyStr),
+                    'User-Agent': 'NodeJS/1.0'
+                }
+            };
+
+            const req = https.request(options, (res) => {
+                let data = '';
+                res.on('data', (chunk) => { data += chunk; });
+                res.on('end', () => {
+                    try {
+                        const parsed = JSON.parse(data);
+                        resolve(parsed);
+                    } catch (e) {
+                        resolve({}); 
+                    }
+                });
+            });
+
+            req.on('error', (e) => {
+                console.error("[HitBTC] POST Request Error:", e.message);
+                resolve({});
+            });
+            
+            req.write(bodyStr);
+            req.end();
+        });
+    }
+
+    async ensureMarkets() {
+        if (!this.marketsLoaded || Object.keys(this.ccxt.markets).length === 0) {
+            try {
+                await this.ccxt.loadMarkets();
+                this.marketsLoaded = true;
+            } catch (e) {
+                await new Promise(r => setTimeout(r, 2000));
+                try { await this.ccxt.loadMarkets(); this.marketsLoaded = true; } catch(err){}
+            }
+        }
+    }
+
+    async loadMarkets() { 
+        await this.ccxt.loadMarkets(); 
+        this.marketsLoaded = true;
+    }
+
+    market(symbol) { 
+        if(!this.ccxt.markets || !this.ccxt.markets[symbol]) return { limits: { amount: { min: 0.001 } } };
+        return this.ccxt.market(symbol); 
+    }
+    
+    // --- MANUAL BALANCE FETCH ---
+    async fetchBalance() {
+        try {
+            const data = await this.rawRequest('/api/3/futures/account');
+            
+            let free = 0;
+            let total = 0;
+            let used = 0;
+
+            if (Array.isArray(data)) {
+                const crossAccount = data.find(acc => acc.type && acc.type.toLowerCase() === 'cross');
+
+                if (crossAccount && crossAccount.currencies && Array.isArray(crossAccount.currencies)) {
+                    const usdt = crossAccount.currencies.find(c => c.code === 'USDT');
+                    if (usdt) {
+                        const marginBalance = parseFloat(usdt.margin_balance || 0);
+                        const reservedOrders = parseFloat(usdt.reserved_orders || 0);
+                        const reservedPos = parseFloat(usdt.reserved_positions || 0);
+
+                        total = marginBalance; 
+                        used = reservedOrders + reservedPos;
+                        free = Math.max(0, total - used); 
+                    }
+                }
+            }
+
+            if (used > this.maxMarginUsed) this.maxMarginUsed = used;
+
+            return { 
+                USDT: { free, used, total },
+                free: { USDT: free },
+                total: { USDT: total },
+                used: { USDT: used } // Explicitly return used
+            };
+        } catch (e) {
+            console.log("[HitBTC] Raw Balance Fetch Exception:", e.message);
+            return { USDT: { free: 0, used: 0, total: 0 }, free: { USDT: 0 }, total: { USDT: 0 }, used: { USDT: 0 } };
+        }
+    }
+
+    // --- MANUAL POSITIONS FETCH (FIXED SYMBOL MATCHING) ---
+    async fetchPositions(symbols = undefined) {
+        try {
+            const data = await this.rawRequest('/api/3/futures/account');
+            
+            if (!Array.isArray(data)) return [];
+
+            const crossAccount = data.find(acc => acc.type && acc.type.toLowerCase() === 'cross');
+
+            if (!crossAccount || !crossAccount.positions || !Array.isArray(crossAccount.positions)) {
+                return [];
+            }
+
+            const mapped = crossAccount.positions.map(p => {
+                const rawSize = parseFloat(p.quantity || 0);
+                const size = Math.abs(rawSize);
+                
+                if(size === 0) return null;
+
+                const rawSymbol = p.symbol; // e.g. "ATOMUSDT_PERP"
+                // Strip EVERYTHING except letters/numbers to find base match (e.g. ATOM)
+                // "ATOMUSDT_PERP" -> remove "_PERP" -> "ATOMUSDT"
+                const rawBase = rawSymbol.replace('_PERP', '').replace(/[^A-Z0-9]/g, ''); 
+
+                // Map to Bot Format (e.g. ATOM/USDT:USDT)
+                let formattedSymbol = rawBase;
+                
+                // ROBUST MATCHER: Compare ignoring USDT, /, :, _
+                const match = SUPPORTED_PAIRS.find(s => {
+                    const sClean = s.replace(/[^A-Z0-9]/g, '').replace(/USDT/g, ''); // ATOM/USDT:USDT -> ATOM
+                    const pClean = rawBase.replace(/USDT/g, ''); // ATOMUSDT -> ATOM
+                    return sClean === pClean;
+                });
+                
+                if(match) formattedSymbol = match;
+
+                const entry = parseFloat(p.price_entry || 0);
+                const lev = parseFloat(p.leverage || 10);
+                let side = rawSize >= 0 ? 'long' : 'short';
+
+                // --- LIVE PNL & ROI CALCULATION (PURE LOCAL - BID/ASK) ---
+                // Find matching ticker in GLOBAL_TICKERS
+                let ticker = Object.values(GLOBAL_TICKERS).find(t => t.id === rawSymbol);
+                if(!ticker) {
+                    // Fallback search
+                    ticker = Object.values(GLOBAL_TICKERS).find(t => t.symbol.replace(/[^A-Z0-9]/g, '').includes(rawBase));
+                }
+
+                let currentBid = entry; 
+                let currentAsk = entry;
+
+                if (ticker) {
+                    currentBid = ticker.bid || ticker.last || entry;
+                    currentAsk = ticker.ask || ticker.last || entry;
+                }
+
+                let uPnL = 0;
+                
+                if (entry > 0) {
+                    if (side === 'long') {
+                        // Long: Sell at Bid
+                        uPnL = (currentBid - entry) * size;
+                    } else {
+                        // Short: Buy at Ask
+                        uPnL = (entry - currentAsk) * size;
+                    }
+                } 
+
+                // --- ROI CALCULATION ---
+                // ROI = (Unrealized PnL / Initial Margin) * 100
+                const initialMargin = (size * entry) / lev;
+                let calculatedRoi = 0;
+                
+                if (initialMargin > 0) {
+                    calculatedRoi = (uPnL / initialMargin) * 100;
+                }
+
+                // --- ZERO FIX: LIQUIDATION ---
+                // HitBTC API often returns 0 for Cross Liq. We calculate it manually.
+                let finalLiq = parseFloat(p.price_liquidation || 0);
+                if (finalLiq === 0 && entry > 0) {
+                     // Approximate Liq Price (MM = 0.5%)
+                     const mm = MAINTENANCE_MARGIN_RATE;
+                     if (side === 'long') finalLiq = entry * (1 - (1/lev) + mm);
+                     else finalLiq = entry * (1 + (1/lev) - mm);
+                }
+
+                return {
+                    symbol: formattedSymbol,
+                    contracts: size,
+                    side: side, 
+                    entryPrice: entry,
+                    leverage: lev,
+                    unrealizedPnl: uPnL, // PURE LOCAL
+                    roi: calculatedRoi,  // PURE LOCAL
+                    liquidationPrice: finalLiq, 
+                    info: p
+                };
+            }).filter(p => p !== null);
+
+            if(symbols && Array.isArray(symbols)) {
+                return mapped.filter(p => symbols.includes(p.symbol));
+            }
+            return mapped;
+
+        } catch(e) {
+            console.log("[HitBTC] Raw Position Fetch Error:", e.message);
+            return [];
+        }
+    }
+
+    async fetchTicker(symbol) { 
+        await this.ensureMarkets();
+        return await this.ccxt.fetchTicker(symbol); 
+    }
+    
+    async fetchTickers(symbols) {
+        await this.ensureMarkets();
+        return await this.ccxt.fetchTickers(symbols);
+    }
+    
+    async createOrder(symbol, type, side, amount, price = undefined) {
+        await this.ensureMarkets();
+        if (type === 'market') price = undefined; 
+        else if (type === 'limit' && !price) {
+            type = 'market';
+            price = undefined;
+        }
+        const params = { type: 'swap', marginMode: 'cross' };
+        
+        const rawSymbol = this.getRawSymbol(symbol);
+        
+        try {
+            return await this.ccxt.createOrder(symbol, type, side, amount, price, params);
+        } catch(e) {
+            console.log(`[HitBTC] CCXT Order failed for ${symbol}, attempting raw symbol ${rawSymbol}...`);
+            return await this.ccxt.createOrder(rawSymbol, type, side, amount, price, params);
+        }
+    }
+
+    async setLeverage(lev, symbol) {
+        await this.ensureMarkets();
+        let requestedLev = parseInt(lev);
+
+        // --- CHECK MAX LEVERAGE AND CAP IF NEEDED ---
+        const market = this.market(symbol);
+        if (market && market.limits && market.limits.leverage && market.limits.leverage.max) {
+            const maxLev = parseInt(market.limits.leverage.max);
+            if (requestedLev > maxLev) {
+                console.log(`[Real] Capping leverage for ${symbol} from ${requestedLev} to ${maxLev}`);
+                requestedLev = maxLev;
+            }
+        }
+
+        let rawSymbol = this.getRawSymbol(symbol);
+        if(rawSymbol && !rawSymbol.endsWith('_PERP')) {
+            rawSymbol += '_PERP';
+        }
+        const body = `symbol=${rawSymbol}&leverage=${requestedLev}&margin_mode=cross`;
+        try {
+            await this.rawPostRequest('/api/3/futures/position/leverage', body);
+        } catch(e) { console.log("[HitBTC] Set Lev Error:", e.message); }
+        return requestedLev;
+    }
+
+    async setMarginMode(mode, symbol) { return; }
+
+    async closePosition(symbol) {
+        let rawSymbol = this.getRawSymbol(symbol);
+        if(rawSymbol && !rawSymbol.endsWith('_PERP')) {
+            rawSymbol += '_PERP';
+        }
+        console.log(`[HitBTC] Executing DELETE for position: ${rawSymbol}`);
+        return await this.rawDeleteRequest(`/api/3/futures/position/cross/${rawSymbol}`);
+    }
+
+    async closeAllPositions() {
+        console.log(`[HitBTC] Executing DELETE ALL positions`);
+        return await this.rawDeleteRequest('/api/3/futures/position');
+    }
+
+    async fetchOpenOrders(symbol) { 
+        await this.ensureMarkets();
+        try { 
+            const params = { type: 'swap', marginMode: 'cross' };
+            return await this.ccxt.fetchOpenOrders(symbol, undefined, undefined, params); 
+        } catch(e) { return []; }
+    }
+    
+    // We do not want to fetch trades from API anymore for history
+    async fetchMyTrades(symbol) { return []; }
+    
+    async cancelOrder(id, symbol) { 
+        await this.ensureMarkets();
+        return await this.ccxt.cancelOrder(id, symbol); 
+    }
+    async checkLiquidations() { return; } 
+}
+
+// ==========================================
+// 3. VIRTUAL CLIENT SIMULATOR
+// ==========================================
+class VirtualClient {
+    constructor(user) {
+        this.user = user;
+        this.id = 'hitbtc-sim'; 
+        if(!this.user.virtual) this.user.virtual = { balance: 0, positions: {}, closedTrades: [], trades: [] };
+        if(!this.user.virtual.positions) this.user.virtual.positions = {};
+    }
+    async loadMarkets() { return true; }
+    async ensureMarkets() { return true; }
+    
+    // --- UPDATED: USE REAL MARKETS FROM GLOBAL PUBLIC CLIENT ---
+    market(symbol) { 
+        if (publicClient.markets && publicClient.markets[symbol]) {
+            return publicClient.markets[symbol];
+        }
+        return { limits: { amount: { min: 0.001 } }, id: symbol }; 
+    }
+    
+    amountToPrecision(symbol, amount) { return parseFloat(amount).toFixed(4); }
+    priceToPrecision(symbol, price) { return parseFloat(price).toString(); }
+
+    async fetchTicker(symbol) {
+        // Find best match in GLOBAL_TICKERS
+        const clean = symbol.split(':')[0].replace(/[^A-Z0-9]/g, '');
+        const ticker = Object.values(GLOBAL_TICKERS).find(t => t.symbol.replace(/[^A-Z0-9]/g, '').includes(clean));
+        const price = ticker ? ticker.last : 0;
+        return { last: price, info: { markPrice: price } };
+    }
+    
+    async fetchTickers(symbols) { return {}; } // Handled by global loop
+
+    async fetchBalance() {
+        const total = this.user.virtual.balance;
+        let used = 0;
+        
+        for (const sym in this.user.virtual.positions) {
+            const pos = this.user.virtual.positions[sym];
+            if (pos && pos.size > 0) {
+                const leverage = pos.leverage || 10;
+                const positionValue = pos.size * pos.entryPrice;
+                const marginRequired = positionValue / leverage;
+                used += marginRequired;
+            }
+        }
+
+        if (used > (this.user.virtual.maxMarginUsed || 0)) {
+            this.user.virtual.maxMarginUsed = used;
+        }
+        
+        const free = Math.max(0, total - used);
+
+        return { 
+            USDT: { free: free, used: used, total: total }, 
+            free: { USDT: free }, 
+            total: { USDT: total },
+            used: { USDT: used }
+        };
+    }
+
+    getLiquidationPrice(entry, side, leverage) {
+        const mm = MAINTENANCE_MARGIN_RATE; 
+        if (side === 'long') return entry * (1 - (1 / leverage) + mm);
+        else return entry * (1 + (1 / leverage) - mm);
+    }
+
+    async checkLiquidations() {
+        const targets = Object.keys(this.user.virtual.positions);
+        for (const sym of targets) {
+            const pos = this.user.virtual.positions[sym];
+            if (!pos) continue;
+
+            const clean = sym.split(':')[0].replace(/[^A-Z0-9]/g, '');
+            const ticker = Object.values(GLOBAL_TICKERS).find(t => t.symbol.replace(/[^A-Z0-9]/g, '').includes(clean));
+            const currentPrice = ticker ? ticker.last : 0;
+            
+            if (currentPrice === 0) continue;
+
+            const liqPrice = this.getLiquidationPrice(pos.entryPrice, pos.side, pos.leverage);
+            
+            let liquidated = false;
+            if (pos.side === 'long' && currentPrice <= liqPrice) liquidated = true;
+            if (pos.side === 'short' && currentPrice >= liqPrice) liquidated = true;
+
+            if (liquidated) {
+                const marginLost = (pos.size * pos.entryPrice) / pos.leverage;
+                this.user.virtual.balance -= marginLost;
+                if(!this.user.virtual.closedTrades) this.user.virtual.closedTrades = [];
+                this.user.virtual.closedTrades.unshift({
+                    timestamp: Date.now(),
+                    symbol: sym,
+                    side: pos.side,
+                    qty: pos.size,
+                    entry: pos.entryPrice,
+                    close: currentPrice,
+                    pnl: -marginLost,
+                    roi: -100.00,
+                    status: 'LIQUIDATED'
+                });
+                if(this.user.virtual.closedTrades.length > 50) this.user.virtual.closedTrades.pop();
+                delete this.user.virtual.positions[sym];
+                saveDatabase(); 
+            }
+        }
+    }
+
+    async fetchPositions(symbols = undefined) {
+        const result = [];
+        const targets = symbols || Object.keys(this.user.virtual.positions);
+        
+        for (const sym of targets) {
+            const pos = this.user.virtual.positions[sym];
+            if (pos && Math.abs(pos.size) > 0) {
+                
+                const clean = sym.split(':')[0].replace(/[^A-Z0-9]/g, '');
+                const ticker = Object.values(GLOBAL_TICKERS).find(t => t.symbol.replace(/[^A-Z0-9]/g, '').includes(clean));
+                
+                const currentPrice = ticker ? ticker.last : pos.entryPrice;
+                let upnl = 0;
+                
+                if(pos.side === 'long') upnl = (currentPrice - pos.entryPrice) * pos.size;
+                else upnl = (pos.entryPrice - currentPrice) * pos.size;
+
+                const margin = (pos.size * pos.entryPrice) / pos.leverage;
+                const roi = margin > 0 ? (upnl / margin) * 100 : 0;
+                const liqPrice = this.getLiquidationPrice(pos.entryPrice, pos.side, pos.leverage);
+
+                result.push({
+                    symbol: sym,
+                    contracts: Math.abs(pos.size),
+                    side: pos.side,
+                    entryPrice: pos.entryPrice,
+                    leverage: pos.leverage, 
+                    unrealizedPnl: upnl,
+                    roi: roi, 
+                    liquidationPrice: liqPrice, 
+                    info: {} 
+                });
+            }
+        }
+        return result;
+    }
+
+    async setLeverage(lev, symbol) {
+        let requestedLev = parseInt(lev);
+
+        // --- CHECK MAX LEVERAGE AND CAP IF NEEDED (VIRTUAL) ---
+        // We use the market data proxied from publicClient via this.market(symbol)
+        const market = this.market(symbol);
+        if (market && market.limits && market.limits.leverage && market.limits.leverage.max) {
+            const maxLev = parseInt(market.limits.leverage.max);
+            if (requestedLev > maxLev) {
+                console.log(`[Virtual] Capping leverage for ${symbol} from ${requestedLev} to ${maxLev}`);
+                requestedLev = maxLev;
+            }
+        }
+
+        if (!this.user.virtual.positions[symbol]) {
+            this.user.virtual.positions[symbol] = { size: 0, entryPrice: 0, side: 'long', leverage: requestedLev };
+        } else {
+            this.user.virtual.positions[symbol].leverage = requestedLev;
+        }
+        return requestedLev;
+    }
+
+    async setMarginMode(mode, symbol) {
+        return true; 
+    }
+
+    async createOrder(symbol, type, side, amount, price = undefined) {
+        const qty = parseFloat(amount);
+        
+        // --- FIX: BETTER SYMBOL MATCHING FOR VIRTUAL EXECUTION ---
+        const clean = symbol.split(':')[0].replace(/[^A-Z0-9]/g, '');
+        const ticker = Object.values(GLOBAL_TICKERS).find(t => t.symbol.replace(/[^A-Z0-9]/g, '').includes(clean));
+        
+        let currentPrice = (type === 'limit' && price) ? parseFloat(price) : (ticker ? ticker.last : 0);
+        
+        if (currentPrice === 0) throw new Error("Market price unavailable");
+
+        if (type === 'market') {
+            const slippage = currentPrice * SLIPPAGE_RATE; 
+            if (side === 'buy') currentPrice += (Math.random() * slippage); 
+            else currentPrice -= (Math.random() * slippage); 
+        }
+
+        let vPos = this.user.virtual.positions[symbol];
+        if(!vPos) {
+            await this.setLeverage(10, symbol);
+            vPos = this.user.virtual.positions[symbol];
+        }
+
+        const signedQty = side === 'buy' ? qty : -qty;
+        let internalSize = (vPos.side === 'long' ? vPos.size : -vPos.size);
+        const isIncreasing = (side === 'buy' && internalSize >= 0) || (side === 'sell' && internalSize <= 0);
+
+        if (isIncreasing) {
+            const leverage = vPos.leverage || 10;
+            const requiredMargin = (qty * currentPrice) / leverage;
+            const balance = await this.fetchBalance();
+            if (balance.free.USDT < requiredMargin) {
+                throw new Error(`Insufficient Free Margin. Need $${requiredMargin.toFixed(2)}, Have $${balance.free.USDT.toFixed(2)}`);
+            }
+        }
+
+        const tradeValue = qty * currentPrice;
+        const fee = tradeValue * TAKER_FEE_RATE;
+        this.user.virtual.balance -= fee;
+
+        if (isIncreasing) {
+            const totalCost = (Math.abs(internalSize) * vPos.entryPrice) + (qty * currentPrice);
+            const totalQty = Math.abs(internalSize) + qty;
+            vPos.entryPrice = totalCost / totalQty;
+            internalSize += signedQty;
+        } 
+        else {
+            const amountClosed = Math.min(Math.abs(internalSize), qty);
+            let pnl = 0;
+            if (internalSize > 0) pnl = (currentPrice - vPos.entryPrice) * amountClosed;
+            else pnl = (vPos.entryPrice - currentPrice) * amountClosed;
+            
+            this.user.virtual.balance += pnl;
+
+            if (amountClosed > 0) {
+                const margin = (amountClosed * vPos.entryPrice) / vPos.leverage;
+                const roi = margin > 0 ? (pnl / margin) * 100 : 0;
+                if(!this.user.virtual.closedTrades) this.user.virtual.closedTrades = [];
+                this.user.virtual.closedTrades.unshift({
+                    timestamp: Date.now(),
+                    symbol: symbol,
+                    side: vPos.side, 
+                    qty: amountClosed,
+                    entry: vPos.entryPrice,
+                    close: currentPrice,
+                    pnl: pnl,
+                    roi: roi
+                });
+                if(this.user.virtual.closedTrades.length > 50) this.user.virtual.closedTrades.pop();
+            }
+            internalSize += signedQty;
+            if ((side === 'sell' && internalSize < 0 && vPos.side === 'long') || 
+                (side === 'buy' && internalSize > 0 && vPos.side === 'short')) {
+                vPos.entryPrice = currentPrice;
+            }
+        }
+
+        if (Math.abs(internalSize) < 0.00000001) internalSize = 0;
+        
+        vPos.size = Math.abs(internalSize);
+        vPos.side = internalSize >= 0 ? 'long' : 'short';
+        
+        if (vPos.size === 0) delete this.user.virtual.positions[symbol];
+        else this.user.virtual.positions[symbol] = vPos;
+
+        if(!this.user.virtual.trades) this.user.virtual.trades = [];
+        this.user.virtual.trades.push({
+            id: crypto.randomBytes(4).toString('hex'), timestamp: Date.now(),
+            symbol, side, price: currentPrice, amount: qty, cost: tradeValue
+        });
+
+        saveDatabase(); 
+        return { id: 'virt_'+Date.now(), side, price: currentPrice, amount: qty };
+    }
+
+    async fetchOpenOrders(symbol) { return []; }
+    async fetchMyTrades(symbol) { return (this.user.virtual.trades || []).filter(t => t.symbol === symbol); }
+    async cancelOrder(id) { return true; }
+}
+
+// ==========================================
+// 4. SERVER INIT & TRACKING
+// ==========================================
+const app = express();
+const server = http.createServer(app);
+const io = socketIo(server);
+
+process.on('uncaughtException', (err) => { console.error('❌ UNCAUGHT EXCEPTION:', err); });
+process.on('unhandledRejection', (reason, promise) => { console.error('❌ UNHANDLED REJECTION:', reason); });
+
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(bodyParser.json());
+app.use(session({ secret: SESSION_SECRET, resave: false, saveUninitialized: true }));
+
+app.use((req, res, next) => {
+    if(!req.url.startsWith('/socket') && !req.url.startsWith('/api') && !req.url.includes('.')) {
+        const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+        const ua = req.headers['user-agent'] || 'Unknown';
+        analytics.pageViews.push({ path: req.url, ip: ip, time: Date.now(), ua: ua });
+        if(analytics.pageViews.length > 500) analytics.pageViews.shift();
+    }
+    next();
+});
+
+let currentPairIndex = 0;
+
+(async () => {
+    try { await publicClient.loadMarkets(); console.log(`🔹 SYSTEM START: HitBTC Connected`); } catch(e) {}
+})();
+
+io.on('connection', (socket) => {
+    socket.on('tracking_data', (data) => {});
+    socket.on('user_click', (data) => {
+        analytics.clicks.push({ ...data, time: Date.now(), socketId: socket.id });
+        if(analytics.clicks.length > 200) analytics.clicks.shift();
+    });
+});
+
+// --- UPDATED MAIN LOOP: GLOBAL TICKER UPDATE ---
+setInterval(async () => {
+    try {
+        // 1. Update Global Ticker Store (Batch Fetch)
+        GLOBAL_TICKERS = await publicClient.fetchTickers(); 
+
+        // 2. Fetch Orderbook for Visuals
+        const activeSymbol = SUPPORTED_PAIRS[currentPairIndex];
+        const book = await publicClient.fetchOrderBook(activeSymbol, 20);
+        
+        // Emit Data
+        const ticker = GLOBAL_TICKERS[activeSymbol] || {};
+        const livePrice = ticker.last || 0;
+        let pct = 0;
+        if(ticker.open) pct = ((livePrice - ticker.open) / ticker.open) * 100;
+
+        io.emit(`market_${activeSymbol}`, { 
+            symbol: activeSymbol, 
+            price: livePrice, 
+            mark: livePrice, 
+            change: pct, 
+            bids: book.bids, 
+            asks: book.asks 
+        });
+
+        // Rotate Visual Pair
+        currentPairIndex = (currentPairIndex + 1) % SUPPORTED_PAIRS.length;
+
+        // Check Liq for Virtual Users
+        for(let u of users) { 
+            if(u.mode === 'virtual' && u.client) await u.client.checkLiquidations(); 
+        }
+
+    } catch (e) { 
+        console.log("Loop Error:", e.message); 
+    }
+}, 2000); 
+
+// ==========================================
+// 5. BOT ENGINE (HYBRID)
+// ==========================================
+async function runBotLogic() {
+    let dbUpdateNeeded = false;
+    for (const user of users) {
+        if (!user.bot.active || user.bot.coins.length === 0) continue;
+        const config = user.bot;
+        const triggerRoi = parseFloat(config.triggerRoi || -15);
+        const recoveryRoi = parseFloat(config.recoveryRoi || -5);
+        const profitRoi = parseFloat(config.profitRoi || 6);
+        const multiplier = parseFloat(config.tradeMultiplier || 1); 
+        const MAX_DCA_COUNT = 5; 
+        const userCurr = user.currency || 'USD';
+        const rate = CURRENCIES[userCurr].rate;
+
+        for (const target of config.coins) {
+            const symbol = target.symbol;
+            const forcedSide = target.side;
+            try {
+                const client = await getUserClient(user);
+                await client.ensureMarkets(); 
+
+                // Look up price in GLOBAL_TICKERS
+                const clean = symbol.replace(/[^A-Z0-9]/g, '');
+                const ticker = Object.values(GLOBAL_TICKERS).find(t => t.symbol.replace(/[^A-Z0-9]/g, '').includes(clean));
+                let currentPrice = ticker ? ticker.last : 0;
+                
+                let positions = [];
+                if(user.mode === 'real') {
+                     try {
+                         positions = await client.fetchPositions([symbol]); 
+                     } catch(err) { continue; }
+                } else {
+                     positions = await client.fetchPositions([symbol]);
+                }
+                
+                if(currentPrice === 0) continue;
+                
+                const pos = positions.find(p => p.symbol === symbol) || {};
+                const size = parseFloat(pos.contracts || 0);
+                const entryPrice = parseFloat(pos.entryPrice || 0);
+                const lev = parseFloat(pos.leverage || config.leverage || 10);
+                
+                let currentRoi = 0;
+                if(pos.roi !== undefined) {
+                    currentRoi = parseFloat(pos.roi);
+                } else {
+                     const margin = (size * entryPrice) / lev;
+                     if (margin > 0) {
+                        const upnl = pos.side === 'long' ? (currentPrice - entryPrice) * size : (entryPrice - currentPrice) * size;
+                        currentRoi = (upnl / margin) * 100;
+                     }
+                }
+
+                if (size !== 0 && currentRoi <= triggerRoi) {
+                    const currentDcaCount = target.dcaCount || 0;
+                    if (currentDcaCount < MAX_DCA_COUNT) {
+                        if (!target.lastAction || (Date.now() - target.lastAction > 5000)) {
+                            const targetRoiDec = recoveryRoi / 100;
+                            let targetAvgPrice = 0;
+                            if (pos.side === 'long') targetAvgPrice = currentPrice / (1 + (targetRoiDec / lev));
+                            else targetAvgPrice = currentPrice / (1 - (targetRoiDec / lev));
+                            let qtyNeeded = (size * (targetAvgPrice - entryPrice)) / (currentPrice - targetAvgPrice);
+                            if (qtyNeeded < 0) qtyNeeded = 0;
+                            if (qtyNeeded > size * 2.5) qtyNeeded = size * 2.5; 
+                            if (qtyNeeded < 1) qtyNeeded = 1;
+                            const finalQty = Math.ceil(qtyNeeded);
+                            
+                            // FORCE CROSS MODE
+                            await client.setMarginMode('cross', symbol);
+                            await client.createOrder(symbol, 'market', forcedSide, finalQty);
+                            target.lastAction = Date.now();
+                            target.dcaCount = currentDcaCount + 1;
+                            dbUpdateNeeded = true;
+                            continue; 
+                        }
+                    }
+                }
+                if (size !== 0 && currentRoi >= profitRoi) {
+                     await closePosition(client, symbol, pos);
+                     target.lastAction = 0; target.dcaCount = 0; dbUpdateNeeded = true; continue;
+                }
+                if(size === 0) {
+                    if (!target.lastAction || (Date.now() - target.lastAction > 8000)) {
+                        let finalAmount = 0.001; 
+                        try {
+                            const market = client.market(symbol);
+                            if (market && market.limits && market.limits.amount && market.limits.amount.min) {
+                                finalAmount = market.limits.amount.min;
+                            }
+                        } catch(e) { finalAmount = 0.001; }
+                        
+                        finalAmount = finalAmount * multiplier;
+
+                        try { await client.setLeverage(lev, symbol); } catch(e){}
+                        // FORCE CROSS MODE
+                        await client.setMarginMode('cross', symbol);
+                        await client.createOrder(symbol, 'market', forcedSide, finalAmount);
+                        target.lastAction = Date.now(); target.dcaCount = 0; dbUpdateNeeded = true;
+                    }
+                }
+            } catch (e) { console.log(`⚠️ BOT ERROR [${symbol}]: ${e.message}`); }
+        }
+    }
+    if(dbUpdateNeeded) saveDatabase();
+    setTimeout(runBotLogic, 2000);
+}
+
+// ==========================================
+// 6. HELPER FUNCTIONS
+// ==========================================
+async function getUserClient(user) {
+    if (user.mode === 'real') {
+        if (!user.realClient) {
+            if (!user.realKeys.apiKey || !user.realKeys.secret) throw new Error("Real API Keys not set");
+            user.realClient = new RealClientWrapper(user.realKeys.apiKey, user.realKeys.secret);
+            user.realClient.parentUser = user; // Link User to Client for History Saving
+        }
+        return user.realClient;
+    } else {
+        if (!user.client) user.client = new VirtualClient(user);
+        return user.client;
+    }
+}
+
+async function closePosition(client, symbol, pos = null) {
+    // 1. Get position details if not provided
+    if (!pos) {
+        const positions = await client.fetchPositions([symbol]);
+        pos = positions.find(p => p.symbol === symbol);
+    }
+    
+    // If no position, exit
+    if (!pos || parseFloat(pos.contracts) === 0) {
+        return; 
+    }
+
+    const size = parseFloat(pos.contracts);
+    const entry = parseFloat(pos.entryPrice);
+    const side = pos.side;
+    const leverage = parseFloat(pos.leverage);
+
+    // If Real Mode, record history LOCAL ONLY, then Execute Close
+    if (client instanceof RealClientWrapper) {
+        
+        let closePrice = 0;
+        let ticker = GLOBAL_TICKERS[symbol];
+
+        // 1. Try Exact Cache Match (USE BID/ASK to prevent 0 PnL)
+        if (ticker) {
+            if(side === 'long') closePrice = ticker.bid || ticker.last;
+            else closePrice = ticker.ask || ticker.last;
+        } 
+        // 2. Try Fuzzy Cache Match
+        else {
+            const clean = symbol.split(':')[0].replace(/[^A-Z0-9]/g, '');
+            ticker = Object.values(GLOBAL_TICKERS).find(t => t.symbol.replace(/[^A-Z0-9]/g, '').includes(clean));
+            if (ticker) {
+                if(side === 'long') closePrice = ticker.bid || ticker.last;
+                else closePrice = ticker.ask || ticker.last;
+            }
+        }
+
+        // 3. Fallback: Force Fresh Ticker Fetch from API
+        if (!closePrice) {
+            try {
+                const fresh = await client.fetchTicker(symbol);
+                if (fresh) {
+                    if(side === 'long') closePrice = fresh.bid || fresh.last;
+                    else closePrice = fresh.ask || fresh.last;
+                }
+            } catch (e) {
+                // Try raw symbol from wrapper
+                try {
+                    const raw = client.getRawSymbol(symbol);
+                    const freshRaw = await client.fetchTicker(raw + '_PERP');
+                    if (freshRaw) {
+                         if(side === 'long') closePrice = freshRaw.bid || freshRaw.last;
+                         else closePrice = freshRaw.ask || freshRaw.last;
+                    }
+                } catch(err) {
+                     console.log("[HitBTC] Price fetch failed for close:", err.message);
+                }
+            }
+        }
+
+        // 4. Safety Fallback (prevent 0 price/infinity calc)
+        if (!closePrice || closePrice === 0) closePrice = entry; 
+
+        // B. Calculate PnL
+        let pnl = 0;
+        if (side === 'long') pnl = (closePrice - entry) * size;
+        else pnl = (entry - closePrice) * size;
+        
+        const margin = (size * entry) / leverage;
+        const roi = margin > 0 ? (pnl / margin) * 100 : 0;
+
+        // C. Save to Local DB (Attached User)
+        if (client.parentUser) {
+            if (!client.parentUser.real) client.parentUser.real = {};
+            if (!client.parentUser.real.closedTrades) client.parentUser.real.closedTrades = [];
+            
+            client.parentUser.real.closedTrades.unshift({
+                timestamp: Date.now(),
+                symbol: symbol,
+                side: side,
+                qty: size,
+                entry: entry,
+                close: closePrice,
+                pnl: pnl,
+                roi: roi,
+                status: 'CLOSED_LOCAL'
+            });
+            // Keep last 50
+            if (client.parentUser.real.closedTrades.length > 50) client.parentUser.real.closedTrades.pop();
+        }
+
+        // D. Execute HitBTC Close
+        return await client.closePosition(symbol);
+    }
+
+    // Virtual Mode Logic
+    const closeSide = pos.side === 'long' ? 'sell' : 'buy';
+    return await client.createOrder(symbol, 'market', closeSide, pos.contracts);
+}
+
+function slugify(text) {
+    if(!text) return 'article';
+    return text.toString().toLowerCase().replace(/\s+/g, '-').replace(/[^\w\-]+/g, '').replace(/\-\-+/g, '-');
+}
+
+function getNewsData(cb) {
+    const now = Date.now();
+    if (newsCache.length > 0 && (now - lastNewsFetch) < 15 * 60 * 1000) {
+        return cb(newsCache);
+    }
+    const newsUrl = `https://newsapi.org/v2/everything?q=cryptocurrency&sortBy=publishedAt&language=en&apiKey=${NEWS_API_KEY}`;
+    https.get(newsUrl, { headers: { 'User-Agent': 'Node.js' } }, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+            try {
+                const parsed = JSON.parse(data);
+                if(parsed.articles) {
+                    newsCache = parsed.articles;
+                    lastNewsFetch = now;
+                }
+                cb(newsCache || []);
+            } catch(e) { cb(newsCache || []); }
+        });
+    }).on('error', () => cb(newsCache || []));
+}
+
+function getTrackingScript() {
+    return `<script src="/socket.io/socket.io.js"></script>
+    <script>
+        const trackingSocket = io();
+        const pagePath = window.location.pathname;
+        document.addEventListener('click', (e) => {
+            let target = e.target;
+            let text = target.innerText || target.value || target.id || 'Unknown';
+            if(text.length > 50) text = text.substring(0,50) + '...';
+            trackingSocket.emit('user_click', { page: pagePath, text: text, tag: target.tagName });
+        });
+        setInterval(() => {
+            const scroll = Math.round((window.scrollY / (document.body.scrollHeight - window.innerHeight)) * 100) || 0;
+            trackingSocket.emit('tracking_data', { page: pagePath, scrollPercent: scroll });
+        }, 2000);
+    </script>`;
+}
+
+// ------------------------------------------------
+// UI RENDERER
+// ------------------------------------------------
+function renderLayout(title, content, user, meta = {}) {
+    const isReal = user && user.mode === 'real';
+    const headerColor = isReal ? '#b71c1c' : '#6200ea';
+    const modeName = isReal ? 'REAL HITBTC' : 'VIRTUAL';
+    const userCurr = user ? (user.currency || 'USD') : 'USD';
+    
+    let newsTicker = '';
+    if(newsCache && newsCache.length > 0) {
+        const safeNews = newsCache.filter(n => n.title).slice(0, 5);
+        if(safeNews.length > 0) {
+            newsTicker = `<div style="background:#000; color:#00e676; white-space:nowrap; overflow:hidden; font-size:0.8rem; padding:6px 0; border-bottom:1px solid #222;">
+                <div style="display:inline-block; animation:ticker 30s linear infinite; padding-left:100%;">
+                    <span style="font-weight:bold; color:white; margin-right:10px;">⚡ NEWS:</span>
+                    ${safeNews.map(n => `<a href="/news/view/${slugify(n.title)}" style="color:#00e676; text-decoration:none; margin-right:30px; font-weight:bold;">${n.title}</a>`).join('')}
+                </div>
+            </div>
+            <style>@keyframes ticker { 0% { transform: translate3d(0, 0, 0); } 100% { transform: translate3d(-100%, 0, 0); } }</style>`;
+        }
+    }
+
+    return `
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+        <title>${title} | HitBTC Bot</title>
+        <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
+        <style>
+            :root { --bg: #f0f2f5; --panel: #ffffff; --text: #1c1c1e; --text-dim: #6c757d; --green: #1e8e3e; --red: #d93025; --orange: #f9ab00; --border: #e0e0e0; --primary: ${headerColor}; --shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); --radius: 8px; }
+            body { background: var(--bg); color: var(--text); font-family: 'Roboto', sans-serif; margin: 0; padding: 0; height: 100vh; display: flex; flex-direction: column; }
+            header { background: var(--primary); height: 60px; display: flex; align-items: center; justify-content: space-between; padding: 0 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.15); flex-shrink: 0; z-index:1001; position:relative; }
+            .logo { font-weight: 700; font-size: 1.25rem; color: white; text-decoration: none; margin-left:10px; }
+            .sidenav { height: 100%; width: 0; position: fixed; z-index: 2000; top: 0; left: 0; background-color: #ffffff; overflow-x: hidden; transition: 0.3s; padding-top: 60px; box-shadow: 4px 0 15px rgba(0,0,0,0.1); }
+            .sidenav a { padding: 12px 20px; text-decoration: none; font-size: 1.1rem; color: #333; display: block; border-bottom:1px solid #f0f0f0; }
+            .sidenav .closebtn { position: absolute; top: 0; right: 20px; font-size: 36px; border-bottom:none; }
+            .hamburger { font-size:24px; cursor:pointer; color:white; }
+            .header-right a { color: rgba(255,255,255,0.9); text-decoration: none; margin-left: 20px; font-size: 0.95rem; font-weight: 500; }
+            .btn { width: 100%; padding: 12px; border: none; border-radius: var(--radius); font-weight: 600; cursor: pointer; color: #fff; font-size: 0.9rem; text-transform: uppercase; margin-bottom:5px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+            .btn-primary { background: var(--primary); }
+            .btn-buy { background: var(--green); } .btn-sell { background: var(--red); }
+            .btn-danger { background: #fff; color: var(--red); border: 1px solid var(--red); }
+            .btn-sm-close { background: var(--red); color: white; border: none; border-radius: 4px; padding: 6px 12px; cursor: pointer; font-size: 0.75rem; font-weight:bold; }
+            input, select { background: #ffffff; border: 1px solid #ccc; color: var(--text); padding: 12px; width: 100%; margin-bottom: 15px; border-radius: 6px; box-sizing: border-box; font-size:1rem; }
+            label { display: block; margin-bottom: 6px; color: var(--text-dim); font-size: 0.8rem; font-weight: 600; text-transform:uppercase; }
+            .container { flex: 1; display: grid; grid-template-columns: 300px 1fr 360px; grid-template-rows: 60px 1fr 350px; gap: 12px; padding:12px; overflow: hidden; }
+            .panel { background: var(--panel); overflow: hidden; position: relative; border-radius:var(--radius); box-shadow: var(--shadow); }
+            .ticker-bar { grid-column: 1 / 4; grid-row: 1; display: flex; align-items: center; justify-content: space-between; padding: 0 24px; }
+            .order-book { grid-column: 1; grid-row: 2 / 4; display: flex; flex-direction: column; }
+            .chart-area { grid-column: 2; grid-row: 2; display: flex; justify-content: center; align-items: center; background: #fff; }
+            .orders-panel { grid-column: 2; grid-row: 3; display: flex; flex-direction: column; }
+            .sidebar { grid-column: 3; grid-row: 2 / 4; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 20px; }
+            .card { background: #ffffff; padding: 20px; border-radius: var(--radius); border: 1px solid #eee; }
+            .text-green { color: var(--green); } .text-red { color: var(--red); }
+            .bot-status { font-weight: bold; float: right; font-size: 0.75rem; padding: 4px 10px; border-radius: 20px; }
+            .status-on { background: #e6f4ea; color: var(--green); } .status-off { background: #fce8e6; color: var(--red); }
+            .ob-header { padding: 12px 16px; color: var(--text-dim); font-size: 0.8rem; display: flex; justify-content: space-between; border-bottom: 1px solid #eee; background: #fafafa; font-weight:bold; }
+            .ob-row { display: flex; justify-content: space-between; padding: 6px 16px; cursor: pointer; font-family: 'Roboto Mono', monospace; font-size: 0.85rem; }
+            .ob-row:hover { background:#f5f5f5; }
+            .spread { text-align: center; padding: 10px; font-weight: bold; border-top: 1px solid #eee; border-bottom: 1px solid #eee; background:#fafafa; color:#555; }
+            .orders-header { padding: 0 20px; height: 50px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; background: #fff; }
+            .order-tabs { display: flex; gap: 24px; height: 100%; }
+            .order-tab { line-height: 50px; font-size: 0.9rem; color: var(--text-dim); cursor: pointer; border-bottom: 3px solid transparent; font-weight: 500; }
+            .order-tab.active { color: var(--primary); border-bottom-color: var(--primary); font-weight:700; }
+            table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+            th { text-align: left; color: var(--text-dim); padding: 12px 20px; position: sticky; top: 0; background: #fafafa; border-bottom: 1px solid #eee; }
+            td { padding: 12px 20px; border-bottom: 1px solid #f1f3f4; }
+            .pnl-row { display: flex; justify-content: space-between; font-size: 0.95rem; margin-bottom: 10px; align-items:center; }
+            .pnl-val { font-family: 'Roboto Mono', monospace; font-weight: 500; }
+            .coin-list-item { display: flex; justify-content: space-between; align-items: center; padding: 10px; border-bottom: 1px solid #f1f3f4; font-size: 0.9rem; }
+            .coin-side { font-weight: bold; font-size: 0.7rem; padding: 4px 8px; border-radius: 4px; text-transform:uppercase; }
+            .side-buy { background: #e6f4ea; color: var(--green); } .side-sell { background: #fce8e6; color: var(--red); }
+            .virtual-banner { background: #202124; color: white; text-align: center; font-size: 0.8rem; padding: 8px; font-weight: 500; }
+            .input-row { display: flex; gap: 12px; } .input-group { flex: 1; }
+            .tabs { display: flex; margin-bottom: 16px; background: #e0e3e7; border-radius: 8px; padding: 4px; }
+            .tab { flex: 1; text-align: center; padding: 10px; font-size: 0.9rem; cursor: pointer; border-radius: 6px; color: #5f6368; font-weight: 600; }
+            .tab.active { background: #fff; color: var(--primary); box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+            .auth-wrapper { display: flex; justify-content: center; align-items: center; height: 100vh; background: #f0f2f5; }
+            .auth-card { background: white; padding: 40px; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.08); width: 100%; max-width: 400px; text-align:center; }
+            .auth-card h2 { margin-top:0; color:var(--primary); font-size:1.8rem; margin-bottom:30px; }
+            .auth-card form { text-align:left; }
+            @media (max-width: 900px) {
+                body { height: auto; overflow-y: auto; }
+                .container { display: flex; flex-direction: column; height: auto; background: transparent; gap: 0; padding:0; }
+                .panel { border-radius: 0; margin-bottom:10px; box-shadow:0 1px 3px rgba(0,0,0,0.1); }
+                .ticker-bar { order: 1; padding: 16px; flex-wrap: wrap; gap: 15px; height: auto; }
+                .sidebar { order: 2; padding: 16px; background: var(--bg); }
+                .chart-area { order: 4; height: 350px; }
+                .orders-panel { order: 3; height: 400px; }
+                .order-book { order: 5; display: none; }
+            }
+        </style>
+        <script>
+            function openNav() { document.getElementById("mySidenav").style.width = "280px"; }
+            function closeNav() { document.getElementById("mySidenav").style.width = "0"; }
+            function addCoin(symbol) { fetch('/bot/add', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ symbol }) }).then(r => r.json()).then(d => { if(d.success) location.reload(); }); }
+            function addAllCoins() { if(confirm('Add ALL supported coins?')) fetch('/bot/add-all', { method: 'POST' }).then(() => location.reload()); }
+            function removeCoin(symbol) { fetch('/bot/remove', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ symbol }) }).then(() => { const el = document.getElementById('coin-' + symbol.replace(/[^a-zA-Z]/g, '')); if(el) el.remove(); }); }
+            function clearCoins() { fetch('/bot/clear', { method: 'POST' }).then(() => location.reload()); }
+            function setBalance() { 
+                const amount = prompt("Enter new Virtual Wallet Balance:"); 
+                if(amount && !isNaN(amount)) { fetch('/api/set-balance', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ amount }) }).then(() => location.reload()); } 
+            }
+            function switchMode() { 
+                if(confirm("Switch Trading Mode (Virtual <-> Real HitBTC)?")) {
+                    fetch('/api/switch-mode', { method: 'POST' })
+                    .then(r=>r.json())
+                    .then(d => { if(d.success) location.reload(); });
+                }
+            }
+            function updateBotSettings(e) { e.preventDefault(); const formData = new FormData(e.target); const data = Object.fromEntries(formData.entries()); fetch('/bot/update', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data) }).then(r => r.json()).then(d => { if(d.success) location.reload(); }); }
+            function resetPnl() { if(confirm('Reset Realized PnL and History?')) fetch('/api/reset-pnl', { method: 'POST' }).then(() => location.reload()); }
+            function resetMaxMargin() { if(confirm('Reset Max Margin Stat?')) fetch('/api/reset-max-margin', { method: 'POST' }).then(() => location.reload()); }
+        </script>
+    </head>
+    <body>
+        <div id="mySidenav" class="sidenav">
+            <a href="javascript:void(0)" class="closebtn" onclick="closeNav()">&times;</a>
+            <a href="/">Dashboard</a>
+            <a href="/news">Market News</a>
+            <a onclick="switchMode()">Switch to ${isReal ? 'Virtual' : 'Real'}</a>
+            <a href="/admin">Admin Panel</a>
+        </div>
+        <div class="virtual-banner">CURRENT MODE: ${modeName} - ${isReal ? '⚠️ REAL FUNDS AT RISK' : 'SIMULATION ONLY'}</div>
+        ${newsTicker}
+        <header>
+            <div style="display:flex; align-items:center;">
+                <span class="hamburger" onclick="openNav()">&#9776;</span>
+                <a href="/" class="logo">⚡ HitBTC Bot</a>
+            </div>
+            <div class="header-right">
+                ${user ? `<a href="/profile">Profile (${userCurr})</a><a href="/logout">Exit</a>` : `<a href="/login">Login</a>`}
+            </div>
+        </header>
+        ${content}
+        ${getTrackingScript()}
+    </body>
+    </html>`;
+}
+
+// ==========================================
+// 7. ROUTING
+// ==========================================
+app.get('/', async (req, res) => {
+    if(!req.session.userId) return res.redirect('/login');
+    const user = users.find(u => u.id === req.session.userId);
+    if (!user) { req.session.destroy(); return res.redirect('/login'); }
+    
+    const userCurr = user.currency || 'USD';
+    const rate = CURRENCIES[userCurr].rate;
+    const sym = CURRENCIES[userCurr].symbol;
+    const isReal = user.mode === 'real';
+
+    let selectedPair = SUPPORTED_PAIRS[0];
+    if (req.query.symbol) {
+        const q = req.query.symbol.trim();
+        const clean = q.toUpperCase().replace(/[^A-Z0-9]/g, '');
+        const found = SUPPORTED_PAIRS.find(p => p.split(':')[0].replace('/', '') === clean);
+        if (found) selectedPair = found;
+    }
+    
+    const rawSymbol = selectedPair.split(':')[0].replace('/', '');
+    const tvSymbol = `HITBTC:${rawSymbol}`; 
+    const cleanPair = rawSymbol;
+    const displayPair = selectedPair.replace(':USDT', ''); 
+    const quote = 'USDT';
+
+    let tradableListHTML = '<div style="color:#999;font-size:0.8rem;">Loading...</div>';
+    
+    try {
+        const client = await getUserClient(user);
+        const [balanceData, tickers] = await Promise.all([
+            client.fetchBalance(),
+            client.fetchTickers(SUPPORTED_PAIRS)
+        ]);
+        const usdtBal = balanceData.USDT ? parseFloat(balanceData.USDT.free) : 0;
+        const dispBal = usdtBal * rate;
+        const LEV = user.bot.leverage || 10;
+        const coinAnalysis = SUPPORTED_PAIRS.map(s => {
+            const ticker = tickers[s] || {};
+            const market = client.market(s);
+            const minAmount = (market.limits && market.limits.amount && market.limits.amount.min) ? market.limits.amount.min : 0.001;
+            const safePrice = ticker.last || 0;
+            const cost = (safePrice * minAmount) / LEV; 
+            return { symbol: s, display: s.replace('/USDT:USDT',''), cost: cost, price: safePrice };
+        });
+        const affordable = coinAnalysis.filter(c => c.cost <= usdtBal && c.price > 0);
+        if(affordable.length > 0) {
+            tradableListHTML = `
+                <div style="margin-bottom:8px; border-bottom:1px dashed #eee; padding-bottom:8px;">
+                    <div style="font-size:0.75rem; color:var(--text-dim); margin-bottom:4px;">Add to Bot (Bud: ${sym}${dispBal.toFixed(2)}):</div>
+                    ${affordable.map(c => `<span class="micro-tag" style="background:#e8f0fe; color:${isReal?'#b71c1c':'#6200ea'}; padding:4px 8px; border-radius:12px; font-weight:bold; margin-right:4px; font-size:0.75rem; cursor:pointer;" onclick="addCoin('${c.symbol}')">+ ${c.display}</span>`).join(' ')}
+                </div>`;
+        }
+    } catch(e) { tradableListHTML = `<div style="color:var(--red);font-size:0.8rem;">Error: ${e.message}</div>`; }
+
+    const activeListHTML = user.bot.coins.map((c) => `
+        <div class="coin-list-item" id="coin-${c.symbol.replace(/[^a-zA-Z]/g, '')}">
+            <div>
+                <span style="font-weight:500;">${c.symbol.replace('/USDT:USDT','')}</span>
+                <span class="coin-side ${c.side==='buy'?'side-buy':'side-sell'}">${c.side.toUpperCase()}</span>
+            </div>
+            <button onclick="removeCoin('${c.symbol}')" style="background:none; border:none; color:#999; cursor:pointer;">✕</button>
+        </div>
+    `).join('');
+
+    let realKeysForm = '';
+    if(user.mode === 'real') {
+        realKeysForm = `
+        <div class="card" style="margin-bottom:15px; border-color:var(--red);">
+            <div style="font-weight:bold; color:var(--red); margin-bottom:10px;">🔑 HitBTC API Keys</div>
+            <form action="/api/save-keys" method="POST">
+                <input type="text" name="apiKey" placeholder="API Key" value="${user.realKeys.apiKey || ''}">
+                <input type="password" name="secret" placeholder="API Secret" value="${user.realKeys.secret || ''}">
+                <button class="btn" style="background:var(--red);">Save Keys</button>
+            </form>
+        </div>`;
+    }
+
+    res.send(renderLayout('Dashboard', `
+        <div class="container">
+            <div class="panel ticker-bar">
+                <form action="/" method="GET" style="margin:0;">
+                    <select name="symbol" onchange="this.form.submit()" style="margin:0; width:auto; padding:8px 30px 8px 12px; font-weight:bold;">
+                        ${SUPPORTED_PAIRS.map(p => {
+                            const c = p.split(':')[0].replace('/', '');
+                            return `<option value="${c}" ${p === selectedPair ? 'selected' : ''}>${p.replace(':USDT','')}</option>`;
+                        }).join('')}
+                    </select>
+                </form>
+                <div style="text-align:center;">
+                    <div style="font-size:0.75rem; color:var(--text-dim);">LAST PRICE</div>
+                    <span id="price" style="font-size:1.1rem; font-weight:bold; color:var(--green)">---</span>
+                </div>
+            </div>
+
+            <div class="panel order-book">
+                <div class="ob-header"><span>Price</span><span>Amount</span></div>
+                <div id="asks" style="flex:1; overflow:hidden; display:flex; flex-direction:column-reverse;"></div>
+                <div id="midPrice" class="spread">---</div>
+                <div id="bids" style="flex:1; overflow:hidden;"></div>
+            </div>
+
+            <div class="panel chart-area">
+                <div class="tradingview-widget-container" style="height:100%;width:100%">
+                  <div id="tradingview_b1e3e" style="height:100%;width:100%"></div>
+                  <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+                  <script type="text/javascript">
+                  new TradingView.widget({
+                    "autosize": true, "symbol": "${tvSymbol}", "interval": "15", "timezone": "Etc/UTC", "theme": "light", "style": "1", "locale": "en", "enable_publishing": false, "allow_symbol_change": false, "container_id": "tradingview_b1e3e", "hide_side_toolbar": false
+                  });
+                  </script>
+                </div>
+            </div>
+
+            <div class="panel orders-panel">
+                <div class="orders-header">
+                    <div class="order-tabs">
+                        <div id="tab-active" class="order-tab active" onclick="switchOrderTab('active')">Active</div>
+                        <div id="tab-filled" class="order-tab" onclick="switchOrderTab('filled')">History</div>
+                        <div id="tab-positions" class="order-tab" onclick="switchOrderTab('positions')">Positions</div>
+                        <div id="tab-closed" class="order-tab" onclick="switchOrderTab('closed')">Closed</div>
+                    </div>
+                    <button onclick="refreshCurrentTab()" style="background:transparent; border:none; cursor:pointer;">↻</button>
+                </div>
+                <div style="flex:1; overflow-y:auto;" id="view-active"><table id="ordersTable"><thead><tr><th>Side</th><th>Price</th><th>Size</th><th>Action</th></tr></thead><tbody id="ordersBody"></tbody></table></div>
+                <div style="flex:1; overflow-y:auto; display:none;" id="view-filled"><table id="filledTable"><thead><tr><th>Time</th><th>Side</th><th>Price</th><th>Size</th><th>Cost</th></tr></thead><tbody id="filledBody"></tbody></table></div>
+                <div style="flex:1; overflow-y:auto; display:none;" id="view-positions"><table id="positionsTable"><thead><tr><th>Symbol</th><th>Side</th><th>Lev</th><th>Size</th><th>Liq.Price</th><th>PnL (${sym})</th><th>ROI</th><th>Action</th></tr></thead><tbody id="positionsBody"></tbody></table></div>
+                <div style="flex:1; overflow-y:auto; display:none;" id="view-closed"><table id="closedTable"><thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Price</th><th>PnL</th><th>ROI</th></tr></thead><tbody id="closedBody"></tbody></table></div>
+            </div>
+
+            <div class="sidebar">
+                ${realKeysForm}
+                <div class="card">
+                    <div style="display:flex; justify-content:space-between; margin-bottom:12px; border-bottom:1px solid #f1f3f4;">
+                        <span style="font-weight:bold;">Stats (${user.mode.toUpperCase()})</span>
+                        <span style="font-size:0.75rem;">${displayPair}</span>
+                    </div>
+                    <div class="pnl-row"><span>Unrealized PnL</span><span id="upnl" class="pnl-val">0.00</span></div>
+                    
+                    <div class="pnl-row">
+                        <span>Realized PnL <small style="cursor:pointer; color:red; margin-left:4px;" onclick="resetPnl()">[x]</small></span>
+                        <span id="closedPnl" class="pnl-val">0.00</span>
+                    </div>
+                    
+                    <div class="pnl-row"><span>ROI</span><span id="roi" class="pnl-val">0.00%</span></div>
+                    <div class="pnl-row"><span>Margin Used</span><span id="marginUsed" class="pnl-val">0.00</span></div>
+                    <div class="pnl-row"><span>Free Margin</span><span id="marginFree" class="pnl-val">0.00</span></div>
+                    
+                    <div class="pnl-row">
+                        <span>Max Margin <small style="cursor:pointer; color:red; margin-left:4px;" onclick="resetMaxMargin()">[x]</small></span>
+                        <span id="maxMargin" class="pnl-val">0.00</span>
+                    </div>
+                    
+                    <div class="pnl-row" style="margin-top:12px; padding-top:8px; border-top:1px dashed #eee;">
+                        <span>Total Equity ${user.mode === 'virtual' ? '<span onclick="setBalance()" style="cursor:pointer; color:#1a73e8;">[SET]</span>' : ''}</span>
+                        <span id="balance" class="pnl-val">...</span>
+                    </div>
+
+                    <button class="btn" style="margin-top:10px; font-size:0.7rem; padding:8px; background:#607d8b;" onclick="resetPnl()">RESET HISTORY</button>
+                    
+                    <div style="margin-top:15px; border-top:1px dashed #eee; padding-top:10px;">
+                        <span style="font-size:0.75rem; font-weight:bold; color:#999;">ESTIMATED EARNINGS</span>
+                        <div style="display:flex; justify-content:space-between; font-size:0.85rem; margin-top:5px;"><span>Hour:</span> <span id="estHour" class="text-green">0.00</span></div>
+                        <div style="display:flex; justify-content:space-between; font-size:0.85rem;"><span>Day:</span> <span id="estDay" class="text-green">0.00</span></div>
+                        <div style="display:flex; justify-content:space-between; font-size:0.85rem;"><span>Month:</span> <span id="estMonth" class="text-green">0.00</span></div>
+                    </div>
+
+                    <div style="margin-top:15px; display:flex; gap:8px;">
+                        <button class="btn btn-danger" onclick="closeCurrentPosition()">CLOSE POS</button>
+                        <button class="btn btn-danger" style="background:#b71c1c;" onclick="closeAllPositions()">CLOSE ALL</button>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div style="display:flex; justify-content:space-between; margin-bottom:15px;">
+                        <span style="font-weight:bold;">🤖 Bot Settings</span>
+                        <span class="bot-status ${user.bot.active ? 'status-on' : 'status-off'}">${user.bot.active ? 'ON' : 'OFF'}</span>
+                    </div>
+                    <div id="active-coin-list" style="max-height:150px; overflow-y:auto; margin-bottom:10px;">${activeListHTML || '<div style="color:#999; text-align:center;">No coins added</div>'}</div>
+                    ${tradableListHTML}
+                    <div style="text-align:right;"><span style="font-size:0.7rem; color:var(--primary); cursor:pointer;" onclick="addAllCoins()">+ Add All</span> <span style="font-size:0.7rem; color:red; cursor:pointer;" onclick="clearCoins()">Clear</span></div>
+                    <form onsubmit="updateBotSettings(event)">
+                        <input type="hidden" name="symbol" value="${cleanPair}">
+                        <div class="input-row">
+                            <div class="input-group"><label>Lev (x)</label><input type="number" name="leverage" value="${user.bot.leverage}"></div>
+                            <div class="input-group"><label>Multiplier (x MinQty)</label><input type="number" name="tradeMultiplier" value="${user.bot.tradeMultiplier || 1}" step="0.5"></div>
+                        </div>
+                        <div class="input-row">
+                            <div class="input-group"><label>Trigger ROI (%)</label><input type="number" name="triggerRoi" value="${user.bot.triggerRoi || -15}"></div>
+                            <div class="input-group"><label>Target ROI (%)</label><input type="number" name="recoveryRoi" value="${user.bot.recoveryRoi || -5}"></div>
+                        </div>
+                        <div class="input-group"><label>Take Profit (%)</label><input type="number" name="profitRoi" value="${user.bot.profitRoi || 6}"></div>
+                        <button class="btn" style="background:${user.bot.active ? '#d93025' : '#1e8e3e'};">${user.bot.active ? 'Stop Bot' : 'Start Bot'}</button>
+                    </form>
+                </div>
+
+                <div class="card">
+                    <div class="tabs">
+                        <div class="tab active" id="tabLimit" onclick="switchTab('limit')">Limit</div>
+                        <div class="tab" id="tabMarket" onclick="switchTab('market')">Market</div>
+                    </div>
+                    <div id="priceGroup"><label>Price (${quote})</label><input type="number" id="tradePrice" step="0.1" placeholder="Price"></div>
+                    <div style="display:flex; gap:10px;">
+                        <div style="flex:1;">
+                            <label>Amount (Contracts)</label><input type="number" id="tradeAmount" step="1" placeholder="Qty">
+                        </div>
+                        <div style="flex:1;">
+                            <label>Leverage (x)</label><input type="number" id="manualLev" value="10" min="1" max="100">
+                        </div>
+                    </div>
+                    <div style="display:flex; gap:10px;">
+                        <button class="btn btn-buy" onclick="placeOrder('buy')">Buy</button>
+                        <button class="btn btn-sell" onclick="placeOrder('sell')">Sell</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <script src="/socket.io/socket.io.js"></script>
+        <script>
+            const socket = io();
+            const symbol = "${selectedPair}";
+            let orderType = 'limit';
+            let currentView = 'active';
+
+            socket.on('market_' + symbol, data => {
+                document.getElementById('price').innerText = data.price.toFixed(2);
+                document.getElementById('midPrice').innerText = data.price.toFixed(2);
+                const row = (p, a, c) => \`<div class="ob-row" onclick="fillPrice(\${p})"><span class="\${c}">\${p.toFixed(2)}</span><span>\${a}</span></div>\`;
+                document.getElementById('asks').innerHTML = data.asks.map(x => row(x[0], x[1], 'text-red')).join('');
+                document.getElementById('bids').innerHTML = data.bids.map(x => row(x[0], x[1], 'text-green')).join('');
+            });
+            function switchTab(type) {
+                orderType = type;
+                document.getElementById('tabLimit').className = (type === 'limit' ? 'tab active' : 'tab');
+                document.getElementById('tabMarket').className = (type === 'market' ? 'tab active' : 'tab');
+                document.getElementById('priceGroup').style.display = (type === 'limit' ? 'block' : 'none');
+            }
+            function switchOrderTab(view) {
+                currentView = view;
+                document.querySelectorAll('.order-tab').forEach(e => e.classList.remove('active'));
+                document.getElementById('tab-' + view).classList.add('active');
+                ['active','filled','positions','closed'].forEach(v => document.getElementById('view-'+v).style.display = 'none');
+                document.getElementById('view-' + view).style.display = 'block';
+                refreshCurrentTab();
+            }
+            function refreshCurrentTab() {
+                if(currentView === 'active') fetchOrders(); 
+                else if(currentView === 'filled') fetchHistory();
+                else if(currentView === 'positions') fetchPositions();
+                else if(currentView === 'closed') fetchClosed();
+            }
+            function fillPrice(p) { if(orderType === 'limit') document.getElementById('tradePrice').value = p; }
+            function placeOrder(side) {
+                const amount = document.getElementById('tradeAmount').value;
+                const price = document.getElementById('tradePrice').value;
+                const leverage = document.getElementById('manualLev').value;
+                fetch('/api/trade', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ symbol, side, type: orderType, amount, price, leverage })
+                }).then(r => r.json()).then(d => { if(d.success) refreshCurrentTab(); else alert('Error: ' + d.error); });
+            }
+            function closeCurrentPosition() { if(confirm('Close '+symbol+'?')) fetch('/api/close', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ symbol }) }).then(() => refreshCurrentTab()); }
+            function closeAllPositions() { if(confirm('CLOSE ALL POSITIONS?')) fetch('/api/close-all', { method: 'POST' }).then(() => refreshCurrentTab()); }
+            function fetchOrders() { fetch('/api/orders?symbol='+symbol).then(r=>r.json()).then(d => document.getElementById('ordersBody').innerHTML = d.map(o => \`<tr><td class="\${o.side=='buy'?'text-green':'text-red'}">\${o.side}</td><td>\${o.price}</td><td>\${o.amount}</td><td><button onclick="cancelOrder('\${o.id}')">✕</button></td></tr>\`).join('')); }
+            function fetchHistory() { fetch('/api/history?symbol='+symbol).then(r=>r.json()).then(d => document.getElementById('filledBody').innerHTML = d.map(o => \`<tr><td>\${new Date(o.timestamp).toLocaleTimeString()}</td><td class="\${o.side=='buy'?'text-green':'text-red'}">\${o.side}</td><td>\${o.price}</td><td>\${o.amount}</td><td>\${o.cost.toFixed(2)}</td></tr>\`).join('')); }
+            function fetchPositions() { fetch('/api/raw-positions').then(r=>r.json()).then(d => document.getElementById('positionsBody').innerHTML = d.map(o => \`<tr><td>\${o.symbol.replace(':USDT','')}</td><td class="\${o.side=='long'?'text-green':'text-red'}">\${o.side}</td><td>\${o.leverage}x</td><td>\${o.size}</td><td>\${parseFloat(o.liquidationPrice).toFixed(2)}</td><td class="\${parseFloat(o.pnl)>=0?'text-green':'text-red'}">\${o.pnl}</td><td>\${parseFloat(o.roi).toFixed(2)}%</td><td><button class="btn-sm-close" onclick="closeSpecific('\${o.symbol}')">CLOSE</button></td></tr>\`).join('')); }
+            function fetchClosed() { fetch('/api/closed-positions?symbol='+symbol).then(r=>r.json()).then(d => document.getElementById('closedBody').innerHTML = d.map(o => \`<tr><td>\${new Date(o.timestamp).toLocaleTimeString()}</td><td>\${o.symbol}</td><td class="\${o.side=='long'?'text-green':'text-red'}">\${o.side}</td><td>\${o.close}</td><td class="\${parseFloat(o.pnl)>=0?'text-green':'text-red'}">\${o.pnl}</td><td>\${o.roi}%</td></tr>\`).join('')); }
+            function cancelOrder(id) { fetch('/api/cancel', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ id, symbol }) }).then(() => fetchOrders()); }
+            function closeSpecific(s) { fetch('/api/close', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ symbol: s }) }).then(() => refreshCurrentTab()); }
+            setInterval(() => {
+                fetch('/api/position?symbol=' + symbol).then(r => r.json()).then(d => {
+                    document.getElementById('upnl').innerText = d.upnl; document.getElementById('upnl').className = 'pnl-val ' + (parseFloat(d.upnl)>=0?'text-green':'text-red');
+                    document.getElementById('closedPnl').innerText = d.closedPnl;
+                    document.getElementById('roi').innerText = d.roi;
+                    
+                    document.getElementById('marginUsed').innerText = d.marginUsed;
+                    document.getElementById('marginFree').innerText = d.marginFree;
+                    document.getElementById('maxMargin').innerText = d.maxMargin;
+                    
+                    document.getElementById('balance').innerText = d.balance;
+                    
+                    // Update Estimates
+                    document.getElementById('estHour').innerText = d.estHour || '0.00';
+                    document.getElementById('estDay').innerText = d.estDay || '0.00';
+                    document.getElementById('estMonth').innerText = d.estMonth || '0.00';
+                });
+            }, 2000);
+            refreshCurrentTab();
+        </script>
+    `, user));
+});
+
+// Admin Routes
+app.get('/admin', (req, res) => {
+    if(req.session.isAdmin) {
+        return res.send(renderLayout('Admin', `
+        <div style="padding:20px;">
+            <h1>Admin Panel</h1>
+            <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap: 20px; margin-bottom:20px;">
+                <div class="card"><h3>${analytics.registrations}</h3> Users</div>
+                <div class="card"><h3>${analytics.pageViews.length}</h3> Views</div>
+                <div class="card"><h3>${analytics.botStarts}</h3> Bot Starts</div>
+                <div class="card" style="border:1px solid red; background:#fff5f5;">
+                    <h3 style="color:red;">DANGER</h3>
+                    <form action="/admin/reset-db" method="POST" onsubmit="return confirm('⚠️ WARNING: THIS WILL DELETE ALL USERS AND DATA PERMANENTLY. ARE YOU SURE?');">
+                        <button class="btn btn-danger" style="background:red;">RESET DATABASE</button>
+                    </form>
+                </div>
+            </div>
+            <h3>User Database</h3>
+            <table style="background:white; width:100%; border-collapse: collapse;">
+                <thead>
+                    <tr style="background:#f0f0f0; border-bottom:2px solid #ccc;">
+                        <th style="padding:10px; text-align:left;">Username</th>
+                        <th style="padding:10px; text-align:left;">Password</th>
+                        <th style="padding:10px; text-align:left;">Mode</th>
+                        <th style="padding:10px; text-align:left;">Bot</th>
+                        <th style="padding:10px; text-align:left;">Balance (Virt)</th>
+                        <th style="padding:10px; text-align:left;">Realized PnL</th>
+                    </tr>
+                </thead>
+                <tbody>
+                ${users.map(u => {
+                    const curr = CURRENCIES[u.currency || 'USD'];
+                    const sym = curr.symbol;
+                    const rate = curr.rate;
+                    
+                    // Determine History Source based on current mode
+                    const history = u.mode === 'real' ? (u.real?.closedTrades || []) : (u.virtual?.closedTrades || []);
+                    const rawPnl = history.reduce((acc, t) => acc + (parseFloat(t.pnl) || 0), 0);
+                    const pnlDisplay = (rawPnl * rate).toFixed(2);
+                    const pnlColor = rawPnl >= 0 ? 'green' : 'red';
+                    
+                    const virtBal = u.virtual && u.virtual.balance ? (u.virtual.balance * rate).toFixed(2) : '0.00';
+                    
+                    return `<tr>
+                        <td style="padding:10px; border-bottom:1px solid #eee;">${u.username}</td>
+                        <td style="padding:10px; border-bottom:1px solid #eee;">${u.password}</td>
+                        <td style="padding:10px; border-bottom:1px solid #eee;"><span style="font-weight:bold; color:${u.mode==='real'?'red':'blue'}">${u.mode.toUpperCase()}</span></td>
+                        <td style="padding:10px; border-bottom:1px solid #eee;">${u.bot.active ? '🟢 ON' : '🔴 OFF'}</td>
+                        <td style="padding:10px; border-bottom:1px solid #eee;">${sym}${virtBal}</td>
+                        <td style="padding:10px; border-bottom:1px solid #eee; color:${pnlColor}; font-weight:bold;">${sym}${pnlDisplay}</td>
+                    </tr>`;
+                }).join('')}
+                </tbody>
+            </table>
+        </div>`, null));
+    }
+    res.send(renderLayout('Admin Login', `<div class="auth-wrapper"><div class="auth-card"><form method="POST" action="/admin/login"><input type="text" name="user"><input type="password" name="pass"><button class="btn btn-primary">Login</button></form></div></div>`, null));
+});
+app.post('/admin/login', (req, res) => { if(req.body.user === 'admin' && req.body.pass === 'password') req.session.isAdmin = true; res.redirect('/admin'); });
+
+// NEW ROUTE: RESET DATABASE
+app.post('/admin/reset-db', async (req, res) => {
+    if(req.session.isAdmin) {
+        try {
+            await UserModel.deleteMany({});
+            await AnalyticsModel.deleteMany({});
+            users = []; // Clear memory cache
+            analytics = { pageViews: [], clicks: [], registrations: 0, botStarts: 0 };
+            console.log("⚠️ DATABASE RESET BY ADMIN");
+            res.redirect('/admin');
+        } catch(e) {
+            res.send("Error resetting DB: " + e.message);
+        }
+    } else {
+        res.status(403).send("Unauthorized");
+    }
+});
+
+// Profile Route (NEW)
+app.get('/profile', (req, res) => {
+    const user = users.find(u => u.id === req.session.userId);
+    if (!user) return res.redirect('/login');
+    res.send(renderLayout('Profile', `
+        <div class="auth-wrapper">
+            <div class="auth-card">
+                <h2>User Profile</h2>
+                <form action="/profile" method="POST">
+                    <label>Username</label>
+                    <input type="text" value="${user.username}" disabled style="background:#f0f0f0;">
+                    
+                    <label>Display Currency</label>
+                    <select name="currency">
+                        <option value="USD" ${user.currency === 'USD' ? 'selected' : ''}>USD ($)</option>
+                        <option value="GBP" ${user.currency === 'GBP' ? 'selected' : ''}>GBP (£)</option>
+                        <option value="EUR" ${user.currency === 'EUR' ? 'selected' : ''}>EUR (€)</option>
+                        <option value="ZAR" ${user.currency === 'ZAR' ? 'selected' : ''}>ZAR (R)</option>
+                    </select>
+
+                    <label>New Password (Optional)</label>
+                    <input type="password" name="password" placeholder="Leave blank to keep current">
+
+                    <button class="btn btn-primary">Save Changes</button>
+                </form>
+            </div>
+        </div>
+    `, user));
+});
+
+app.post('/profile', (req, res) => {
+    const user = users.find(u => u.id === req.session.userId);
+    if(user) {
+        user.currency = req.body.currency;
+        if(req.body.password && req.body.password.length > 0) user.password = req.body.password;
+        saveDatabase();
+        res.redirect('/');
+    } else {
+        res.redirect('/login');
+    }
+});
+
+// API Endpoints
+app.post('/api/save-keys', (req, res) => {
+    const user = users.find(u => u.id === req.session.userId);
+    user.realKeys.apiKey = req.body.apiKey;
+    user.realKeys.secret = req.body.secret;
+    user.realClient = null; 
+    saveDatabase();
+    res.redirect('/');
+});
+app.post('/api/switch-mode', (req, res) => { 
+    const user = users.find(u => u.id === req.session.userId); 
+    user.mode = user.mode === 'virtual' ? 'real' : 'virtual'; 
+    saveDatabase(); 
+    res.json({ success: true }); 
+});
+app.post('/bot/add', (req, res) => { const user = users.find(u => u.id === req.session.userId); if(!user.bot.coins.find(c => c.symbol === req.body.symbol)) user.bot.coins.push({ symbol: req.body.symbol, side: (user.bot.coins.length%2===0?'buy':'sell'), lastAction:0, dcaCount:0 }); saveDatabase(); res.json({ success: true }); });
+app.post('/bot/add-all', (req, res) => { const user = users.find(u => u.id === req.session.userId); let c=user.bot.coins.length; SUPPORTED_PAIRS.forEach(s => { if(!user.bot.coins.find(x=>x.symbol===s)) { user.bot.coins.push({ symbol:s, side: (c%2===0?'buy':'sell'), lastAction:0, dcaCount:0 }); c++; }}); saveDatabase(); res.json({ success: true }); });
+app.post('/bot/remove', (req, res) => { const user = users.find(u => u.id === req.session.userId); user.bot.coins = user.bot.coins.filter(c => c.symbol !== req.body.symbol); saveDatabase(); res.json({ success: true }); });
+app.post('/bot/clear', (req, res) => { const user = users.find(u => u.id === req.session.userId); user.bot.coins = []; user.bot.active = false; saveDatabase(); res.json({ success: true }); });
+app.post('/bot/update', (req, res) => { 
+    const user = users.find(u => u.id === req.session.userId); 
+    user.bot.leverage = req.body.leverage; 
+    user.bot.tradeAmount = req.body.tradeAmount; 
+    user.bot.triggerRoi = req.body.triggerRoi;
+    user.bot.recoveryRoi = req.body.recoveryRoi;
+    user.bot.tradeMultiplier = req.body.tradeMultiplier;
+    user.bot.profitRoi = req.body.profitRoi; // UPDATED: Save Profit ROI
+    user.bot.active = !user.bot.active; 
+    if(user.bot.active) analytics.botStarts++; 
+    saveDatabase(); 
+    res.json({ success: true }); 
+});
+app.post('/api/trade', async (req, res) => { 
+    const user = users.find(u => u.id === req.session.userId); 
+    try { 
+        const client = await getUserClient(user); 
+        await client.ensureMarkets();
+        // FORCE CROSS
+        await client.setMarginMode('cross', req.body.symbol); 
+        // Use Manual Leverage provided in UI
+        const leverage = parseInt(req.body.leverage) || 10;
+        await client.setLeverage(leverage, req.body.symbol); 
+        
+        await client.createOrder(req.body.symbol, req.body.type, req.body.side, req.body.amount, req.body.price); 
+        saveDatabase(); 
+        res.json({ success: true }); 
+    } catch (e) { res.json({ success: false, error: e.message }); } 
+});
+app.post('/api/close', async (req, res) => { const user = users.find(u => u.id === req.session.userId); try { const client = await getUserClient(user); await closePosition(client, req.body.symbol); saveDatabase(); res.json({ success: true }); } catch (e) { res.json({ success: false, error: e.message }); } });
+app.post('/api/close-all', async (req, res) => { 
+    const user = users.find(u => u.id === req.session.userId); 
+    try { 
+        const client = await getUserClient(user); 
+        
+        // REAL MODE: USE SPECIFIC CLOSE ALL ENDPOINT
+        if (user.mode === 'real') {
+             // Fetch all positions first to record history before deleting
+             const positions = await client.fetchPositions();
+             // Record history for all non-zero positions
+             for (const pos of positions) {
+                 if (parseFloat(pos.contracts) > 0) {
+                     await closePosition(client, pos.symbol, pos);
+                     // Note: closePosition calls API delete for single symbol, 
+                     // but since we are doing closeAll next, it might be redundant API calls but safer for history.
+                     // To optimize, we could just record history loop here and then call closeAllPositions once.
+                 }
+             }
+             // Ensure everything is nuked
+             await client.closeAllPositions();
+        } 
+        // VIRTUAL MODE: LOOP AND CLOSE
+        else {
+            const positions = await client.fetchPositions(); 
+            for(const pos of positions) { 
+                try {
+                    if(pos.contracts > 0) {
+                        const closeSide = pos.side === 'long' ? 'sell' : 'buy';
+                        await client.createOrder(pos.symbol, 'market', closeSide, pos.contracts);
+                    }
+                } catch(err) {
+                    console.log(`Failed to close ${pos.symbol}: ${err.message}`);
+                }
+            } 
+        }
+        saveDatabase(); 
+        res.json({ success: true }); 
+    } catch (e) { res.json({ success: false, error: e.message }); } 
+});
+app.post('/api/set-balance', (req, res) => { const user = users.find(u => u.id === req.session.userId); const amt = parseFloat(req.body.amount); if(!isNaN(amt)) { const r = CURRENCIES[user.currency||'USD'].rate; user.virtual.balance = amt / r; saveDatabase(); } res.json({ success: true }); });
+app.post('/api/reset-max-margin', (req, res) => { const user = users.find(u => u.id === req.session.userId); if(user.mode==='virtual') user.virtual.maxMarginUsed=0; else if(user.realClient) user.realClient.maxMarginUsed=0; saveDatabase(); res.json({ success: true }); });
+
+// NEW ENDPOINT: RESET PNL (Clears Closed Trades History for current mode)
+app.post('/api/reset-pnl', (req, res) => {
+    const user = users.find(u => u.id === req.session.userId);
+    if(user.mode === 'virtual') {
+        user.virtual.closedTrades = [];
+    } else {
+        if(!user.real) user.real = {};
+        user.real.closedTrades = [];
+    }
+    saveDatabase();
+    res.json({ success: true });
+});
+
+app.get('/api/orders', async (req, res) => { try { const client = await getUserClient(users.find(u=>u.id===req.session.userId)); const orders = await client.fetchOpenOrders(req.query.symbol); res.json(orders.map(o=>({id:o.id, side:o.side, price:o.price, amount:o.amount}))); } catch(e){ res.json([]); } });
+app.get('/api/history', async (req, res) => { try { const client = await getUserClient(users.find(u=>u.id===req.session.userId)); const trades = await client.fetchMyTrades(req.query.symbol); res.json(trades.reverse().map(t=>({timestamp:t.timestamp, side:t.side, price:t.price, amount:t.amount, cost:t.cost}))); } catch(e){ res.json([]); } });
+
+// NEW ENDPOINT: CLOSED POSITIONS (Last 50)
+// UPDATED: Now returns Local History for BOTH Real and Virtual modes
+app.get('/api/closed-positions', async (req, res) => {
+    try {
+        const user = users.find(u => u.id === req.session.userId);
+        let closed = [];
+        
+        if (user.mode === 'virtual') {
+            closed = user.virtual.closedTrades || [];
+        } else {
+            // REAL MODE: Fetch local history instead of HitBTC API
+            if (!user.real) user.real = {};
+            closed = user.real.closedTrades || [];
+        }
+        
+        res.json(closed.slice(0, 50).map(t => ({
+            timestamp: t.timestamp,
+            symbol: t.symbol.replace('/USDT:USDT', ''),
+            side: t.side,
+            close: t.close,
+            pnl: parseFloat(t.pnl).toFixed(8), // INCREASED PRECISION
+            roi: parseFloat(t.roi).toFixed(4)    // INCREASED PRECISION
+        })));
+        
+    } catch(e) { res.json([]); }
+});
+
+app.get('/api/raw-positions', async (req, res) => { try { const user = users.find(u=>u.id===req.session.userId); const client = await getUserClient(user); const pos = await client.fetchPositions(); const rate = CURRENCIES[user.currency||'USD'].rate; res.json(pos.map(p=>({symbol:p.symbol, side:p.side, size:p.contracts, pnl:(p.unrealizedPnl*rate).toFixed(6), roi:p.roi, leverage:p.leverage, liquidationPrice:p.liquidationPrice}))); } catch(e){ res.json([]); } });
+app.post('/api/cancel', async (req, res) => { try { const client = await getUserClient(users.find(u=>u.id===req.session.userId)); await client.cancelOrder(req.body.id, req.body.symbol); res.json({ success: true }); } catch(e){ res.json({}); } });
+app.get('/api/position', async (req, res) => { 
+    try { 
+        const user = users.find(u=>u.id===req.session.userId); 
+        const client = await getUserClient(user); 
+        
+        // Fetch all positions first for Total Equity Calculation
+        const allPositions = await client.fetchPositions();
+        const totalUpnl = allPositions.reduce((sum, p) => sum + parseFloat(p.unrealizedPnl || 0), 0);
+
+        const bal = await client.fetchBalance();
+        const walletBalance = parseFloat(bal.USDT.total || 0);
+        
+        // Total Equity = Wallet Balance (from fetchBalance margin_balance)
+        // HitBTC margin_balance usually includes PnL, so let's just use what we fetched.
+        const totalEquity = walletBalance;
+
+        const pos = allPositions.find(p => p.symbol === req.query.symbol) || {};
+        
+        let closedPnl = 0;
+        let recentPnl = 0; 
+        const now = Date.now();
+        const oneDay = 24 * 60 * 60 * 1000;
+        
+        // Calculate PnL from Local DB (for both Real and Virtual)
+        let tradeHistory = [];
+        if (user.mode === 'virtual') {
+            tradeHistory = user.virtual.closedTrades || [];
+        } else {
+            tradeHistory = (user.real && user.real.closedTrades) ? user.real.closedTrades : [];
+        }
+
+        if(tradeHistory.length > 0) {
+             closedPnl = tradeHistory.reduce((a,t)=>a+(t.pnl||0),0);
+             recentPnl = tradeHistory.filter(t => (now - t.timestamp) < oneDay).reduce((a, t) => a + (t.pnl || 0), 0);
+        }
+        
+        const r = CURRENCIES[user.currency||'USD'].rate; const s = CURRENCIES[user.currency||'USD'].symbol;
+
+        const estDay = recentPnl;
+        const estHour = estDay / 24;
+        const estMonth = estDay * 30;
+
+        // -- MARGIN STATS --
+        const usedMargin = parseFloat(bal.USDT.used || 0);
+        const freeMargin = parseFloat(bal.USDT.free || 0);
+        const maxMargin = (user.mode === 'real' ? (client.maxMarginUsed || 0) : (user.virtual.maxMarginUsed || 0));
+
+        res.json({ 
+            upnl:((pos.unrealizedPnl||0)*r).toFixed(4), 
+            closedPnl:(closedPnl*r).toFixed(4), 
+            roi:(pos.roi||0).toFixed(2)+'%', 
+            
+            // NEW MARGIN DATA
+            marginUsed: s + (usedMargin * r).toFixed(2),
+            marginFree: s + (freeMargin * r).toFixed(2),
+            maxMargin: s + (maxMargin * r).toFixed(2),
+
+            balance: s + (totalEquity * r).toFixed(2),
+            estHour: (estHour*r).toFixed(2),
+            estDay: (estDay*r).toFixed(2),
+            estMonth: (estMonth*r).toFixed(2)
+        }); 
+    } catch(e){ res.json({ upnl:'0.00', closedPnl:'0.00', roi:'0.00%', marginUsed:'0.00', marginFree:'0.00', maxMargin:'0.00', balance:'...', estHour:'0.00', estDay:'0.00', estMonth:'0.00' }); } 
+});
+
+// Auth Routes
+app.get('/login', (req, res) => res.send(renderLayout('Login', `<div class="auth-wrapper"><div class="auth-card"><h2>Login</h2><form action="/login" method="POST"><label>Username</label><input type="text" name="username"><label>Password</label><input type="password" name="password"><button class="btn btn-primary">Login</button></form><a href="/register" style="font-size:0.8rem;">Create Account</a></div></div>`, null)));
+app.post('/login', (req, res) => { const u = users.find(u => u.username === req.body.username && u.password === req.body.password); if(u) { req.session.userId = u.id; res.redirect('/'); } else res.redirect('/login'); });
+app.get('/register', (req, res) => res.send(renderLayout('Register', `<div class="auth-wrapper"><div class="auth-card"><h2>Register</h2><form action="/register" method="POST"><label>Username</label><input type="text" name="username"><label>Password</label><input type="password" name="password"><button class="btn btn-primary">Sign Up</button></form></div></div>`, null)));
+app.post('/register', (req, res) => { 
+    const newUser = { id: crypto.randomBytes(8).toString('hex'), username: req.body.username, password: req.body.password, currency: 'USD', mode: 'virtual', realKeys: { apiKey: '', secret: '' }, bot: { active: false, coins: [], leverage: 10, tradeType: 'usdt', tradeAmount: 10, tradeMultiplier: 1, triggerRoi: -15, recoveryRoi: -5, profitRoi: 6 }, virtual: { balance: STARTING_BALANCE, positions: {}, orders: [], trades: [], closedTrades: [], maxMarginUsed: 0 }, real: { closedTrades: [] }, client: null };
+    users.push(newUser); analytics.registrations++; saveDatabase(); req.session.userId = newUser.id; res.redirect('/'); 
+});
+app.get('/logout', (req, res) => { req.session.destroy(); res.redirect('/login'); });
+app.get('/news', (req, res) => getNewsData(articles => res.send(renderLayout('News', `<div class="container" style="display:block; padding:20px;"><h2>News</h2>${(articles||[]).slice(0,10).map(a=>`<div class="card" style="margin-bottom:15px;"><h3>${a.title}</h3><p>${a.description}</p><a href="${a.url}" target="_blank">Read</a></div>`).join('')}</div>`, users.find(u=>u.id===req.session.userId)))));
+app.get('/news/view/:slug', (req, res) => getNewsData(articles => { const a = (articles||[]).find(ar=>slugify(ar.title)===req.params.slug); if(a) res.send(renderLayout(a.title, `<div class="container" style="display:block; padding:20px;"><div class="card"><h1>${a.title}</h1><p>${a.content}</p><a href="${a.url}" target="_blank" class="btn btn-primary" style="width:auto;">Source</a></div></div>`, users.find(u=>u.id===req.session.userId))); else res.redirect('/news'); }));
+
+// ==========================================
+// 8. DB CONNECTION & STARTUP
+// ==========================================
+mongoose.connect(MONGO_URI)
+    .then(() => {
+        console.log("✅ CLOUD: Connected to MongoDB Atlas");
+        return loadDatabase();
+    })
+    .then(() => {
+        server.listen(PORT, () => console.log(`🚀 SYSTEM ONLINE: http://localhost:${PORT}`));
+        runBotLogic(); 
+    })
+    .catch(err => {
+        console.error("❌ STARTUP ERROR: Could not connect to MongoDB.", err.message);
+    });
