@@ -1,0 +1,2889 @@
+const express = require('express');
+const http = require('http');
+const https = require('https'); 
+const socketIo = require('socket.io');
+const ccxt = require('ccxt');
+const session = require('express-session');
+const bodyParser = require('body-parser');
+const crypto = require('crypto');
+const mongoose = require('mongoose'); 
+
+// ==========================================
+// 1. CONFIGURATION (CURRENCIES SET HERE)
+// ==========================================
+const PORT = process.env.PORT || 3000;
+const SESSION_SECRET = 'hitbtc-ultimate-secret-v45';
+
+// 🔴 MONGODB CONNECTION STRING
+const MONGO_URI = 'mongodb+srv://web88888888888888_db_user:ZETrZHXzaxoekjkm@clusterweb8888.l0rv6hv.mongodb.net/?appName=Clusterweb8888';
+
+const NEWS_API_KEY = '5b69e4d348ad436ca832910872c7d663'; 
+const STARTING_BALANCE = 1000.00; 
+
+// [PROFILE LOGIC] CURRENCY RATES
+const CURRENCIES = {
+    'USD': { rate: 1.0, symbol: '$' },
+    'GBP': { rate: 0.79, symbol: '£' },
+    'EUR': { rate: 0.93, symbol: '€' },
+    'ZAR': { rate: 19.0, symbol: 'R' },
+    'JPY': { rate: 150.0, symbol: '¥' },
+    'AUD': { rate: 1.53, symbol: 'A$' },
+    'CAD': { rate: 1.36, symbol: 'C$' },
+    'CHF': { rate: 0.88, symbol: 'Fr' },
+    'INR': { rate: 83.5, symbol: '₹' },
+    'BRL': { rate: 5.00, symbol: 'R$' },
+    'RUB': { rate: 92.5, symbol: '₽' },
+    'NGN': { rate: 1600.0, symbol: '₦' },
+    'BTC': { rate: 0.0000105, symbol: '₿' }, 
+    'ETH': { rate: 0.00037, symbol: 'Ξ' },   
+    'SOL': { rate: 0.006, symbol: '◎' },     
+    'XRP': { rate: 0.40, symbol: 'XRP' },    
+    'LTC': { rate: 0.014, symbol: 'Ł' },
+    'DOT': { rate: 0.14, symbol: 'DOT' },
+    'DOGE': { rate: 8.33, symbol: 'Ð' },
+    'TRX': { rate: 7.69, symbol: 'TRX' },
+    'ADA': { rate: 1.66, symbol: '₳' }
+};
+
+// TRADING SETTINGS
+const MAINTENANCE_MARGIN_RATE = 0.005; 
+const TAKER_FEE_RATE = 0.0006;         
+const SLIPPAGE_RATE = 0.0002;          
+
+const args = process.argv.slice(2);
+const coinArg = args.find(a => a.startsWith('--coin='));
+let customPairs = [];
+
+if (coinArg) {
+    const rawValue = coinArg.split('=')[1];
+    if (rawValue) {
+        const rawCoins = rawValue.split(/[\s,]+/).filter(c => c.trim().length > 0);
+        customPairs = rawCoins.map(c => {
+            let pair = c.trim();
+            if (!pair.includes('/') && !pair.includes(':')) {
+                pair = `${pair.toUpperCase()}/USDT:USDT`;
+            }
+            return pair;
+        });
+    }
+}
+
+const DEFAULT_PAIRS = [
+    'BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'XRP/USDT:USDT', 
+    'LINK/USDT:USDT', 'DOGE/USDT:USDT', 'PEPE/USDT:USDT', 'SHIB/USDT:USDT', 
+    'ADA/USDT:USDT', 'AVAX/USDT:USDT', 'EOS/USDT:USDT', 'LTC/USDT:USDT', 'ATOM/USDT:USDT',
+    'DOT/USDT:USDT', 'UNI/USDT:USDT', 'MATIC/USDT:USDT', 'BCH/USDT:USDT', 
+    'ETC/USDT:USDT', 'XLM/USDT:USDT', 'TRX/USDT:USDT', 'FIL/USDT:USDT', 
+    'VET/USDT:USDT', 'AAVE/USDT:USDT', 'SAND/USDT:USDT', 'MANA/USDT:USDT',
+    'AXS/USDT:USDT', 'NEAR/USDT:USDT', 'ALGO/USDT:USDT', 'FTM/USDT:USDT'
+];
+
+const SUPPORTED_PAIRS = customPairs.length > 0 ? customPairs : DEFAULT_PAIRS;
+
+// Market Data Cache
+let GLOBAL_TICKERS = {};
+let newsCache = [];
+let lastNewsFetch = 0;
+
+// ==========================================
+// 1.1 CLOUD PERSISTENCE LAYER (MongoDB)
+// ==========================================
+
+let analytics = {
+    pageViews: [],
+    totalViews: 0, 
+    clicks: [],
+    registrations: 0,
+    botStarts: 0
+};
+
+// 🔴 GLOBAL LOCK & STATUS
+let isResetting = false; 
+let dbStatus = "Initializing";
+let lastDbError = "None";
+
+// Mongoose Schemas
+const UserSchema = new mongoose.Schema({
+    id: { type: String, unique: true },
+    username: String,
+    password: String,
+    currency: String,
+    mode: String,
+    realKeys: Object,
+    bot: Object,
+    virtual: Object,
+    real: Object 
+}, { strict: false });
+
+const AnalyticsSchema = new mongoose.Schema({
+    id: { type: String, default: 'global_stats' },
+    data: Object
+}, { strict: false });
+
+const UserModel = mongoose.model('User', UserSchema);
+const AnalyticsModel = mongoose.model('Analytics', AnalyticsSchema);
+
+// 🛡️ DATA SANITIZER (FIXED: WIPES CORRUPTED DATA)
+function sanitizeUser(user) {
+    if (user.virtual && user.virtual.balance) {
+        if (!isFinite(user.virtual.balance) || isNaN(user.virtual.balance) || Math.abs(user.virtual.balance) > 1e20) {
+            user.virtual.balance = STARTING_BALANCE; 
+        }
+    }
+    // Structure repair
+    if (!user.virtual) user.virtual = {};
+    if (!user.virtual.positions) user.virtual.positions = {};
+    
+    // ⚡⚡ AUTO-FIX CORRUPTED POSITIONS ⚡⚡
+    for (const sym in user.virtual.positions) {
+        const p = user.virtual.positions[sym];
+        if (!p || !isFinite(p.size) || isNaN(p.size) || Math.abs(p.size) > 1000000000000) {
+            console.log(`⚠️ DETECTED CORRUPTED POSITION [${sym}]: Size ${p.size}. Resetting.`);
+            delete user.virtual.positions[sym];
+        }
+    }
+
+    if (!user.virtual.closedTrades) user.virtual.closedTrades = [];
+    if (!user.virtual.trades) user.virtual.trades = []; 
+    if (!user.real) user.real = {};
+    if (!user.real.closedTrades) user.real.closedTrades = [];
+    if (!user.bot) user.bot = {};
+    if (typeof user.bot.active !== 'boolean') user.bot.active = false; 
+    
+    // DEFAULT STRATEGY
+    if (!user.bot.strategy) user.bot.strategy = 'neural';
+
+    // AI & GHOST STATS
+    if (!user.bot.aiStats) user.bot.aiStats = { accuracy: 50, mode: 'Learning', bias: 'Neutral' };
+    if (!user.bot.learningMemory) user.bot.learningMemory = { wins: 0, total: 0 };
+    if (!user.bot.ghostMemory) user.bot.ghostMemory = { wins: 0, total: 0, activeSims: [] };
+    
+    return user;
+}
+
+// 🛡️ REFACTORED SAVE LOGIC
+async function saveUser(user) {
+    if (isResetting) return;
+    try {
+        sanitizeUser(user);
+        
+        // ⚡ CRITICAL FIX: Ensure user is a Plain Object before saving
+        // This solves Mongoose tracking issues with Mixed types
+        const cleanUser = user.toObject ? user.toObject() : { ...user };
+        
+        // Strip internal fields we don't want to overwrite clumsily
+        delete cleanUser._id;
+        delete cleanUser.__v;
+        delete cleanUser.client;
+        delete cleanUser.realClient;
+
+        // Trim History
+        if(cleanUser.virtual && cleanUser.virtual.trades && cleanUser.virtual.trades.length > 100) {
+            cleanUser.virtual.trades = cleanUser.virtual.trades.slice(-100);
+        }
+        if(cleanUser.virtual && cleanUser.virtual.closedTrades && cleanUser.virtual.closedTrades.length > 50) {
+            cleanUser.virtual.closedTrades = cleanUser.virtual.closedTrades.slice(-50);
+        }
+
+        await UserModel.findOneAndUpdate({ id: cleanUser.id }, cleanUser, { upsert: true, returnDocument: 'after' });
+        dbStatus = "Connected (Writes OK)";
+    } catch (e) {
+        console.error("❌ Cloud Save Error:", e.message);
+        dbStatus = "Write Error: " + e.message;
+        lastDbError = e.message;
+    }
+}
+
+async function loadAnalytics() {
+    try {
+        const cloudAnalytics = await AnalyticsModel.findOne({ id: 'global_stats' });
+        if (cloudAnalytics && cloudAnalytics.data) {
+            analytics = cloudAnalytics.data;
+            if(!analytics.totalViews) analytics.totalViews = analytics.pageViews.length;
+        }
+    } catch (e) { console.log("Analytics Load Error", e.message); }
+}
+
+async function saveAnalytics() {
+    try { await AnalyticsModel.findOneAndUpdate({ id: 'global_stats' }, { data: analytics }, { upsert: true }); } catch(e){}
+}
+
+// Global Public Client
+const publicClient = new ccxt.hitbtc({ 
+    enableRateLimit: true,
+    timeout: 60000, 
+    options: { defaultType: 'swap' } 
+});
+
+// ==========================================
+// 2. REAL CLIENT WRAPPER
+// ==========================================
+class RealClientWrapper {
+    constructor(apiKey, secret) {
+        this.apiKey = apiKey; 
+        this.secret = secret; 
+        this.parentUser = null; 
+        this.ccxt = new ccxt.hitbtc({
+            apiKey: apiKey,
+            secret: secret,
+            enableRateLimit: true,
+            timeout: 60000,
+            options: { defaultType: 'swap' } 
+        });
+        this.maxMarginUsed = 0; 
+        this.marketsLoaded = false;
+    }
+
+    getRawSymbol(botSymbol) {
+        if (!botSymbol) return '';
+        return botSymbol.replace(':USDT', '').replace('/', '');
+    }
+
+    async rawRequest(path) {
+        return new Promise((resolve, reject) => {
+            const auth = 'Basic ' + Buffer.from(this.apiKey + ':' + this.secret).toString('base64');
+            const options = { hostname: 'api.hitbtc.com', path: path, method: 'GET', headers: { 'Authorization': auth, 'Content-Type': 'application/json', 'User-Agent': 'NodeJS/1.0' } };
+            const req = https.request(options, (res) => {
+                let data = ''; res.on('data', (chunk) => { data += chunk; }); res.on('end', () => { try { resolve(JSON.parse(data)); } catch (e) { resolve([]); } });
+            });
+            req.on('error', (e) => { resolve([]); }); req.setTimeout(10000, () => { req.destroy(); resolve([]); }); req.end();
+        });
+    }
+
+    async rawDeleteRequest(path) {
+        return new Promise((resolve, reject) => {
+            const auth = 'Basic ' + Buffer.from(this.apiKey + ':' + this.secret).toString('base64');
+            const options = { hostname: 'api.hitbtc.com', path: path, method: 'DELETE', headers: { 'Authorization': auth, 'Content-Type': 'application/json', 'User-Agent': 'NodeJS/1.0' } };
+            const req = https.request(options, (res) => {
+                let data = ''; res.on('data', (chunk) => { data += chunk; }); res.on('end', () => { try { if(!data) return resolve({ success: true }); resolve(JSON.parse(data)); } catch (e) { resolve({ success: true }); } });
+            });
+            req.on('error', (e) => { resolve({}); }); req.setTimeout(10000, () => { req.destroy(); resolve({}); }); req.end();
+        });
+    }
+
+    async rawPostRequest(path, bodyStr) {
+        return new Promise((resolve, reject) => {
+            const auth = 'Basic ' + Buffer.from(this.apiKey + ':' + this.secret).toString('base64');
+            const options = { hostname: 'api.hitbtc.com', path: path, method: 'POST', headers: { 'Authorization': auth, 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(bodyStr), 'User-Agent': 'NodeJS/1.0' } };
+            const req = https.request(options, (res) => {
+                let data = ''; res.on('data', (chunk) => { data += chunk; }); res.on('end', () => { try { resolve(JSON.parse(data)); } catch (e) { resolve({}); } });
+            });
+            req.on('error', (e) => { resolve({}); }); req.setTimeout(10000, () => { req.destroy(); resolve({}); }); req.write(bodyStr); req.end();
+        });
+    }
+
+    async ensureMarkets() {
+        if (!this.marketsLoaded || Object.keys(this.ccxt.markets).length === 0) {
+            try { await this.ccxt.loadMarkets(); this.marketsLoaded = true; } catch (e) { await new Promise(r => setTimeout(r, 2000)); try { await this.ccxt.loadMarkets(); this.marketsLoaded = true; } catch(err){} }
+        }
+    }
+    async loadMarkets() { await this.ccxt.loadMarkets(); this.marketsLoaded = true; }
+    market(symbol) { if(!this.ccxt.markets || !this.ccxt.markets[symbol]) return { limits: { amount: { min: 0.001 } } }; return this.ccxt.market(symbol); }
+    
+    async fetchBalance() {
+        try {
+            const data = await this.rawRequest('/api/3/futures/account');
+            let free = 0; let total = 0; let used = 0;
+            if (Array.isArray(data)) {
+                const crossAccount = data.find(acc => acc.type && acc.type.toLowerCase() === 'cross');
+                if (crossAccount && crossAccount.currencies && Array.isArray(crossAccount.currencies)) {
+                    const usdt = crossAccount.currencies.find(c => c.code === 'USDT');
+                    if (usdt) {
+                        const marginBalance = parseFloat(usdt.margin_balance || 0);
+                        const reservedOrders = parseFloat(usdt.reserved_orders || 0);
+                        const reservedPos = parseFloat(usdt.reserved_positions || 0);
+                        total = marginBalance; used = reservedOrders + reservedPos; free = Math.max(0, total - used); 
+                    }
+                }
+            }
+            if (used > this.maxMarginUsed) this.maxMarginUsed = used;
+            return { USDT: { free, used, total }, free: { USDT: free }, total: { USDT: total }, used: { USDT: used } };
+        } catch (e) { return { USDT: { free: 0, used: 0, total: 0 }, free: { USDT: 0 }, total: { USDT: 0 }, used: { USDT: 0 } }; }
+    }
+
+    async fetchPositions(symbols = undefined) {
+        try {
+            const data = await this.rawRequest('/api/3/futures/account');
+            if (!Array.isArray(data)) return [];
+            const crossAccount = data.find(acc => acc.type && acc.type.toLowerCase() === 'cross');
+            if (!crossAccount || !crossAccount.positions || !Array.isArray(crossAccount.positions)) return [];
+            
+            // Map positions first
+            const mapped = await Promise.all(crossAccount.positions.map(async (p) => {
+                const rawSize = parseFloat(p.quantity || 0);
+                const size = Math.abs(rawSize);
+                if(size === 0) return null;
+                
+                const rawSymbol = p.symbol; 
+                const rawBase = rawSymbol.replace('_PERP', '').replace(/[^A-Z0-9]/g, ''); 
+                let formattedSymbol = rawBase;
+                const match = SUPPORTED_PAIRS.find(s => { const sClean = s.replace(/[^A-Z0-9]/g, '').replace(/USDT/g, ''); const pClean = rawBase.replace(/USDT/g, ''); return sClean === pClean; });
+                if(match) formattedSymbol = match;
+                
+                const entry = parseFloat(p.price_entry || 0);
+                let lev = parseFloat(p.leverage);
+                if (!lev || isNaN(lev)) {
+                     if (this.parentUser && this.parentUser.bot && this.parentUser.bot.leverage) lev = parseFloat(this.parentUser.bot.leverage);
+                     else lev = 10;
+                }
+                
+                let side = rawSize >= 0 ? 'long' : 'short';
+                
+                // ⚡⚡⚡ EXCHANGE PNL SYNC (BID/ASK + FEES) ⚡⚡⚡
+                let ticker = Object.values(GLOBAL_TICKERS).find(t => 
+                    t.symbol === formattedSymbol || 
+                    t.id === rawSymbol || 
+                    t.symbol.replace(/[^A-Z0-9]/g, '') === rawSymbol.replace(/[^A-Z0-9]/g, '')
+                );
+
+                if (!ticker) {
+                    try { ticker = await this.fetchTicker(formattedSymbol); } catch(e) { /* ignore */ }
+                }
+                
+                // 1. Determine Exit Price (Bid for Long, Ask for Short)
+                let exitPrice = entry;
+                if (ticker) {
+                    if (side === 'long') {
+                        exitPrice = parseFloat(ticker.bid || ticker.last || entry);
+                    } else {
+                        exitPrice = parseFloat(ticker.ask || ticker.last || entry);
+                    }
+                }
+
+                // 2. Gross PnL
+                let grossPnl = 0;
+                if (side === 'long') {
+                    grossPnl = (exitPrice - entry) * size;
+                } else {
+                    grossPnl = (entry - exitPrice) * size;
+                }
+
+                // 3. Subtract Taker Fee (Include Fees in Unrealized PnL)
+                const exitVal = exitPrice * size;
+                const fee = exitVal * TAKER_FEE_RATE;
+                const netPnl = grossPnl - fee;
+
+                // 4. ROI
+                const initialMargin = (size * entry) / lev;
+                let calculatedRoi = 0;
+                if (initialMargin > 0) calculatedRoi = (netPnl / initialMargin) * 100;
+
+                let finalLiq = parseFloat(p.price_liquidation || 0);
+                if (finalLiq === 0 && entry > 0) { const mm = MAINTENANCE_MARGIN_RATE; if (side === 'long') finalLiq = entry * (1 - (1/lev) + mm); else finalLiq = entry * (1 + (1/lev) - mm); }
+                
+                return { 
+                    symbol: formattedSymbol, 
+                    contracts: size, 
+                    side: side, 
+                    entryPrice: entry, 
+                    leverage: lev, 
+                    unrealizedPnl: netPnl, 
+                    roi: calculatedRoi, 
+                    liquidationPrice: finalLiq, 
+                    info: p 
+                };
+            }));
+
+            const finalPositions = mapped.filter(p => p !== null);
+            if(symbols && Array.isArray(symbols)) return finalPositions.filter(p => symbols.includes(p.symbol));
+            return finalPositions;
+        } catch(e) { return []; }
+    }
+
+    async fetchTicker(symbol) { await this.ensureMarkets(); return await this.ccxt.fetchTicker(symbol); }
+    async fetchTickers(symbols) { await this.ensureMarkets(); return await this.ccxt.fetchTickers(symbols); }
+    
+    // ⚡⚡⚡ EXECUTION LOGIC: STRICT ADHERENCE ⚡⚡⚡
+    async createOrder(symbol, type, side, amount, price = undefined) {
+        await this.ensureMarkets();
+        
+        let executedSide = side; 
+
+        if (type === 'market') price = undefined; else if (type === 'limit' && !price) { type = 'market'; price = undefined; }
+        const params = { type: 'swap', marginMode: 'cross' };
+        
+        try { return await this.ccxt.createOrder(symbol, type, executedSide, amount, price, params); } catch(e) {
+            let rawSymbol = this.getRawSymbol(symbol); if(rawSymbol && !rawSymbol.endsWith('_PERP')) rawSymbol += '_PERP';
+            try { return await this.ccxt.createOrder(rawSymbol, type, executedSide, amount, price, params); } catch(innerE) {
+                const body = `symbol=${rawSymbol}&side=${executedSide}&type=${type}&quantity=${amount}&margin_mode=cross` + (price ? `&price=${price}` : '');
+                try { const rawResult = await this.rawPostRequest('/api/3/futures/order', body); if (rawResult && rawResult.id) return rawResult; if (rawResult && rawResult.error) throw new Error(rawResult.error.message || rawResult.error); return rawResult; } catch (rawE) { throw new Error(`Real Trade Failed: ${rawE.message}`); }
+            }
+        }
+    }
+
+    // ⚡⚡⚡ LEVERAGE LOGIC: CAP AT COIN MAX (REAL FIX) ⚡⚡⚡
+    async setLeverage(lev, symbol) {
+        await this.ensureMarkets();
+        let requestedLev = parseInt(lev);
+        
+        // --- LOGIC START: CHECK AND CAP LEVERAGE STRICTLY ---
+        const market = this.market(symbol);
+        let maxLev = 20; 
+        if (market && market.limits && market.limits.leverage && market.limits.leverage.max) { 
+            maxLev = parseInt(market.limits.leverage.max); 
+        } else if (symbol.includes('BTC') || symbol.includes('ETH')) {
+            maxLev = 100;
+        }
+
+        if (requestedLev > maxLev) requestedLev = maxLev; 
+        // --- LOGIC END ---
+
+        let rawSymbol = this.getRawSymbol(symbol); 
+        if(rawSymbol && !rawSymbol.endsWith('_PERP')) rawSymbol += '_PERP';
+        
+        const body = `symbol=${rawSymbol}&leverage=${requestedLev}&margin_mode=cross`;
+        try { await this.rawPostRequest('/api/3/futures/position/leverage', body); } catch(e) { console.log("[HitBTC] Set Lev Error:", e.message); }
+        return requestedLev;
+    }
+
+    async setMarginMode(mode, symbol) { return; }
+    async closePosition(symbol) { let rawSymbol = this.getRawSymbol(symbol); if(rawSymbol && !rawSymbol.endsWith('_PERP')) rawSymbol += '_PERP'; return await this.rawDeleteRequest(`/api/3/futures/position/cross/${rawSymbol}`); }
+    async closeAllPositions() { return await this.rawDeleteRequest('/api/3/futures/position'); }
+    async fetchOpenOrders(symbol) { await this.ensureMarkets(); try { const params = { type: 'swap', marginMode: 'cross' }; return await this.ccxt.fetchOpenOrders(symbol, undefined, undefined, params); } catch(e) { return []; } }
+    async fetchMyTrades(symbol) { return []; }
+    async cancelOrder(id, symbol) { await this.ensureMarkets(); return await this.ccxt.cancelOrder(id, symbol); }
+    async checkLiquidations() { return; } 
+}
+
+// ==========================================
+// 3. VIRTUAL CLIENT SIMULATOR
+// ==========================================
+class VirtualClient {
+    constructor(user) {
+        this.user = user;
+        this.id = 'hitbtc-sim'; 
+        if(!this.user.virtual) this.user.virtual = { balance: 0, positions: {}, closedTrades: [], trades: [] };
+        if(!this.user.virtual.positions) this.user.virtual.positions = {};
+    }
+    async loadMarkets() { return true; }
+    async ensureMarkets() { return true; }
+    
+    // FIX: Using global publicClient to access real markets
+    market(symbol) { if (publicClient.markets && publicClient.markets[symbol]) return publicClient.markets[symbol]; return { limits: { amount: { min: 0.001 } }, id: symbol }; }
+    amountToPrecision(symbol, amount) { return parseFloat(amount).toFixed(4); }
+    priceToPrecision(symbol, price) { return parseFloat(price).toString(); }
+
+    async fetchTicker(symbol) {
+        const clean = symbol.split(':')[0].replace(/[^A-Z0-9]/g, '');
+        const ticker = Object.values(GLOBAL_TICKERS).find(t => t.symbol.replace(/[^A-Z0-9]/g, '').includes(clean));
+        const price = ticker ? ticker.last : 0;
+        return { last: price, bid: ticker?.bid, ask: ticker?.ask, info: { markPrice: price } };
+    }
+    async fetchTickers(symbols) { return {}; } 
+
+    async fetchBalance() {
+        const total = this.user.virtual.balance;
+        let used = 0;
+        for (const sym in this.user.virtual.positions) {
+            const pos = this.user.virtual.positions[sym];
+            if (pos && pos.size > 0) {
+                const leverage = pos.leverage || 10;
+                const positionValue = pos.size * pos.entryPrice;
+                const marginRequired = positionValue / leverage;
+                used += marginRequired;
+            }
+        }
+        if (used > (this.user.virtual.maxMarginUsed || 0)) this.user.virtual.maxMarginUsed = used;
+        const free = Math.max(0, total - used);
+        return { USDT: { free: free, used: used, total: total }, free: { USDT: free }, total: { USDT: total }, used: { USDT: used } };
+    }
+
+    getLiquidationPrice(entry, side, leverage) { const mm = MAINTENANCE_MARGIN_RATE; if (side === 'long') return entry * (1 - (1 / leverage) + mm); else return entry * (1 + (1 / leverage) - mm); }
+
+    async checkLiquidations() {
+        const targets = Object.keys(this.user.virtual.positions);
+        for (const sym of targets) {
+            const pos = this.user.virtual.positions[sym];
+            if (!pos) continue;
+            const clean = sym.split(':')[0].replace(/[^A-Z0-9]/g, '');
+            const ticker = Object.values(GLOBAL_TICKERS).find(t => t.symbol.replace(/[^A-Z0-9]/g, '').includes(clean));
+            const currentPrice = ticker ? ticker.last : 0;
+            if (currentPrice === 0) continue;
+            const liqPrice = this.getLiquidationPrice(pos.entryPrice, pos.side, pos.leverage);
+            let liquidated = false;
+            if (pos.side === 'long' && currentPrice <= liqPrice) liquidated = true;
+            if (pos.side === 'short' && currentPrice >= liqPrice) liquidated = true;
+            if (liquidated) {
+                const marginLost = (pos.size * pos.entryPrice) / pos.leverage;
+                this.user.virtual.balance -= marginLost;
+                let vol = 0;
+                try {
+                    const candles = await publicClient.fetchOHLCV(sym, '1m', undefined, 3);
+                    if(candles && candles.length > 0) {
+                        let maxH = 0; let minL = Infinity;
+                        candles.forEach(c => { if(c[2] > maxH) maxH = c[2]; if(c[3] < minL && c[3] > 0) minL = c[3]; });
+                        if(maxH > 0 && minL !== Infinity) vol = ((maxH - minL) / minL) * 100;
+                    }
+                } catch(e) {}
+                if(!this.user.virtual.closedTrades) this.user.virtual.closedTrades = [];
+                this.user.virtual.closedTrades.unshift({ timestamp: Date.now(), symbol: sym, side: pos.side, qty: pos.size, entry: pos.entryPrice, close: currentPrice, pnl: -marginLost, roi: -100.00, volatility: vol, status: 'LIQUIDATED' });
+                if(!this.user.bot.learningMemory) this.user.bot.learningMemory = { wins: 0, total: 0 };
+                this.user.bot.learningMemory.total++;
+                if(this.user.virtual.closedTrades.length > 50) this.user.virtual.closedTrades.pop();
+                delete this.user.virtual.positions[sym];
+                await saveUser(this.user); 
+            }
+        }
+    }
+
+    async fetchPositions(symbols = undefined) {
+        const result = [];
+        const targets = symbols || Object.keys(this.user.virtual.positions);
+        for (const sym of targets) {
+            const pos = this.user.virtual.positions[sym];
+            if (pos && Math.abs(pos.size) > 0) {
+                const clean = sym.split(':')[0].replace(/[^A-Z0-9]/g, '');
+                const ticker = Object.values(GLOBAL_TICKERS).find(t => t.symbol.replace(/[^A-Z0-9]/g, '').includes(clean));
+                
+                // ⚡⚡⚡ STRICT BID/ASK PNL FOR VIRTUAL (WITH FEES) ⚡⚡⚡
+                let exitPrice = pos.entryPrice;
+                if (ticker) {
+                    if (pos.side === 'long') {
+                        // Sell into Bid
+                        exitPrice = parseFloat(ticker.bid || ticker.last || pos.entryPrice);
+                    } else {
+                        // Buy from Ask
+                        exitPrice = parseFloat(ticker.ask || ticker.last || pos.entryPrice);
+                    }
+                }
+
+                let grossPnl = 0;
+                if(pos.side === 'long') {
+                    grossPnl = (exitPrice - pos.entryPrice) * pos.size;
+                } else {
+                    grossPnl = (pos.entryPrice - exitPrice) * pos.size;
+                }
+
+                // Subtract Fee
+                const exitVal = exitPrice * pos.size;
+                const fee = exitVal * TAKER_FEE_RATE;
+                const netPnl = grossPnl - fee;
+                
+                const margin = (pos.size * pos.entryPrice) / pos.leverage;
+                const roi = margin > 0 ? (netPnl / margin) * 100 : 0;
+                const liqPrice = this.getLiquidationPrice(pos.entryPrice, pos.side, pos.leverage);
+                
+                result.push({ 
+                    symbol: sym, 
+                    contracts: Math.abs(pos.size), 
+                    side: pos.side, 
+                    entryPrice: pos.entryPrice, 
+                    leverage: pos.leverage, 
+                    unrealizedPnl: netPnl, 
+                    roi: roi, 
+                    liquidationPrice: liqPrice, 
+                    info: {} 
+                });
+            }
+        }
+        return result;
+    }
+
+    // ⚡⚡⚡ LEVERAGE LOGIC: CAP AT COIN MAX (VIRTUAL SIMULATION) ⚡⚡⚡
+    async setLeverage(lev, symbol) {
+        let requestedLev = parseInt(lev);
+        
+        // --- LOGIC START: CHECK AND CAP LEVERAGE FOR VIRTUAL ---
+        try {
+            const market = this.market(symbol);
+            if (market && market.limits && market.limits.leverage && market.limits.leverage.max) { 
+                const maxLev = parseInt(market.limits.leverage.max); 
+                if (requestedLev > maxLev) requestedLev = maxLev; 
+            }
+        } catch(e) { }
+        // --- LOGIC END ---
+
+        if (!this.user.virtual.positions[symbol]) this.user.virtual.positions[symbol] = { size: 0, entryPrice: 0, side: 'long', leverage: requestedLev };
+        else this.user.virtual.positions[symbol].leverage = requestedLev;
+        return requestedLev;
+    }
+
+    async setMarginMode(mode, symbol) { return true; }
+
+    async createOrder(symbol, type, side, amount, price = undefined) {
+        const qty = parseFloat(amount);
+        
+        // 🛡️ VIRTUAL SAFETY CAP (Prevents e+144 bugs)
+        if (qty > 1000000) throw new Error("Order size too large for virtual mode");
+
+        const clean = symbol.split(':')[0].replace(/[^A-Z0-9]/g, '');
+        const ticker = Object.values(GLOBAL_TICKERS).find(t => t.symbol.replace(/[^A-Z0-9]/g, '').includes(clean));
+        
+        let currentPrice = (type === 'limit' && price) ? parseFloat(price) : (ticker ? ticker.last : 0);
+        if (currentPrice === 0) throw new Error("Market price unavailable");
+        
+        let executedSide = side; 
+        
+        let vPos = this.user.virtual.positions[symbol];
+        if(!vPos) { await this.setLeverage(10, symbol); vPos = this.user.virtual.positions[symbol]; }
+
+        // ⚡⚡⚡ STRICT EXECUTION FIX: USE BID/ASK FOR FILLS ⚡⚡⚡
+        if (type === 'market' && ticker) {
+            // BUYING (Long Entry or Short Close) -> ASK PRICE
+            if (executedSide === 'buy') {
+                currentPrice = ticker.ask || ticker.last;
+            } 
+            // SELLING (Short Entry or Long Close) -> BID PRICE
+            else {
+                currentPrice = ticker.bid || ticker.last;
+            }
+        }
+
+        const signedQty = executedSide === 'buy' ? qty : -qty;
+        let internalSize = (vPos.side === 'long' ? vPos.size : -vPos.size);
+        const isIncreasing = (executedSide === 'buy' && internalSize >= 0) || (executedSide === 'sell' && internalSize <= 0);
+        
+        if (isIncreasing) {
+            const leverage = vPos.leverage || 10;
+            const requiredMargin = (qty * currentPrice) / leverage;
+            const balance = await this.fetchBalance();
+            if (balance.free.USDT < requiredMargin) throw new Error(`Insufficient Free Margin. Need $${requiredMargin.toFixed(2)}, Have $${balance.free.USDT.toFixed(2)}`);
+        }
+        const tradeValue = qty * currentPrice;
+        const fee = tradeValue * TAKER_FEE_RATE;
+        this.user.virtual.balance -= fee;
+        if (isIncreasing) {
+            const totalCost = (Math.abs(internalSize) * vPos.entryPrice) + (qty * currentPrice);
+            const totalQty = Math.abs(internalSize) + qty;
+            vPos.entryPrice = totalCost / totalQty;
+            internalSize += signedQty;
+        } 
+        else {
+            const amountClosed = Math.min(Math.abs(internalSize), qty);
+            let pnl = 0;
+            if (internalSize > 0) pnl = (currentPrice - vPos.entryPrice) * amountClosed; else pnl = (vPos.entryPrice - currentPrice) * amountClosed;
+            
+            this.user.virtual.balance += pnl;
+            if (amountClosed > 0) {
+                const margin = (amountClosed * vPos.entryPrice) / vPos.leverage;
+                const roi = margin > 0 ? (pnl / margin) * 100 : 0;
+                let vol = 0;
+                try {
+                    const candles = await publicClient.fetchOHLCV(symbol, '1m', undefined, 3);
+                    if(candles && candles.length > 0) {
+                        let maxH = 0; let minL = Infinity;
+                        candles.forEach(c => { if(c[2] > maxH) maxH = c[2]; if(c[3] < minL && c[3] > 0) minL = c[3]; });
+                        if(maxH > 0 && minL !== Infinity) vol = ((maxH - minL) / minL) * 100;
+                    }
+                } catch(e) {}
+                if(!this.user.virtual.closedTrades) this.user.virtual.closedTrades = [];
+                this.user.virtual.closedTrades.unshift({ timestamp: Date.now(), symbol: symbol, side: vPos.side, qty: amountClosed, entry: vPos.entryPrice, close: currentPrice, pnl: pnl, roi: roi, volatility: vol, status: 'CLOSED' });
+                if(!this.user.bot.learningMemory) this.user.bot.learningMemory = { wins: 0, total: 0 };
+                this.user.bot.learningMemory.total++;
+                if(pnl > 0) this.user.bot.learningMemory.wins++;
+                if(this.user.virtual.closedTrades.length > 50) this.user.virtual.closedTrades.pop();
+            }
+            internalSize += signedQty;
+            if ((executedSide === 'sell' && internalSize < 0 && vPos.side === 'long') || (executedSide === 'buy' && internalSize > 0 && vPos.side === 'short')) { vPos.entryPrice = currentPrice; }
+        }
+        if (Math.abs(internalSize) < 0.00000001) internalSize = 0;
+        vPos.size = Math.abs(internalSize);
+        vPos.side = internalSize >= 0 ? 'long' : 'short';
+        
+        // 🛡️ DOUBLE CHECK: If size is basically zero, delete pos
+        if (vPos.size < 0.000001) delete this.user.virtual.positions[symbol]; 
+        else this.user.virtual.positions[symbol] = vPos;
+        
+        if(!this.user.virtual.trades) this.user.virtual.trades = [];
+        this.user.virtual.trades.push({ id: crypto.randomBytes(4).toString('hex'), timestamp: Date.now(), symbol, side: executedSide, price: currentPrice, amount: qty, cost: tradeValue });
+        if(this.user.virtual.trades.length > 100) this.user.virtual.trades.shift();
+        await saveUser(this.user); 
+        return { id: 'virt_'+Date.now(), side: executedSide, price: currentPrice, amount: qty };
+    }
+    async fetchOpenOrders(symbol) { return []; }
+    async fetchMyTrades(symbol) { return (this.user.virtual.trades || []).filter(t => t.symbol === symbol); }
+    async cancelOrder(id) { return true; }
+}
+
+// ==========================================
+// 4. SERVER INIT & TRACKING
+// ==========================================
+const app = express();
+const server = http.createServer(app);
+const io = socketIo(server);
+
+process.on('uncaughtException', (err) => { console.error('❌ UNCAUGHT EXCEPTION:', err); });
+process.on('unhandledRejection', (reason, promise) => { console.error('❌ UNHANDLED REJECTION:', reason); });
+
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(bodyParser.json());
+app.use(session({ secret: SESSION_SECRET, resave: false, saveUninitialized: true }));
+
+app.use((req, res, next) => {
+    if(!req.url.startsWith('/socket') && !req.url.startsWith('/api') && !req.url.includes('.')) {
+        const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+        const ua = req.headers['user-agent'] || 'Unknown';
+        analytics.pageViews.push({ path: req.url, ip: ip, time: Date.now(), ua: ua });
+        if(analytics.pageViews.length > 500) analytics.pageViews.shift();
+        if(!analytics.totalViews) analytics.totalViews = 0;
+        analytics.totalViews++;
+        saveAnalytics(); // Save analytics to DB on change
+    }
+    next();
+});
+
+let currentPairIndex = 0;
+
+(async () => {
+    try { await publicClient.loadMarkets(); console.log(`🔹 SYSTEM START: HitBTC Connected`); } catch(e) {}
+})();
+
+io.on('connection', (socket) => {
+    socket.on('tracking_data', (data) => {});
+    socket.on('user_click', (data) => {
+        analytics.clicks.push({ ...data, time: Date.now(), socketId: socket.id });
+        if(analytics.clicks.length > 200) analytics.clicks.shift();
+    });
+});
+
+// ⚡⚡⚡ UPDATED INTERVAL TO 1000MS FOR FASTER TICKS ⚡⚡⚡
+setInterval(async () => {
+    try {
+        GLOBAL_TICKERS = await publicClient.fetchTickers(); 
+        const activeSymbol = SUPPORTED_PAIRS[currentPairIndex];
+        const book = await publicClient.fetchOrderBook(activeSymbol, 20);
+        const ticker = GLOBAL_TICKERS[activeSymbol] || {};
+        const livePrice = ticker.last || 0;
+        let pct = 0;
+        if(ticker.open) pct = ((livePrice - ticker.open) / ticker.open) * 100;
+        io.emit(`market_${activeSymbol}`, { symbol: activeSymbol, price: livePrice, mark: livePrice, change: pct, bids: book.bids, asks: book.asks });
+        currentPairIndex = (currentPairIndex + 1) % SUPPORTED_PAIRS.length;
+    } catch (e) { console.log("Loop Error:", e.message); }
+}, 1000); 
+
+// ==========================================
+// 5. BOT ENGINE (HEIKIN ASHI 5M TREND + REVERSAL DETECTION)
+// ==========================================
+
+// ⚡⚡⚡ FIXED PNL CALCULATION FUNCTION - USES BID/ASK + FEES ⚡⚡⚡
+function calculatePositionPNL(position, ticker, mode) {
+    if (!position || !ticker) return { pnl: 0, roi: 0, exitPrice: 0 };
+    
+    const size = parseFloat(position.contracts || 0);
+    const entryPrice = parseFloat(position.entryPrice || 0);
+    const leverage = parseFloat(position.leverage || 10);
+    const side = position.side || 'long';
+    
+    if (size === 0 || entryPrice === 0) return { pnl: 0, roi: 0, exitPrice: 0 };
+    
+    // ⚡ USER FIX: Use Bid/Ask Price (Spread)
+    // Long exits on BID (Selling)
+    // Short exits on ASK (Buying)
+    
+    let calculationPrice = entryPrice; // Default fallback
+    
+    if (ticker) {
+        if (side === 'long') {
+            calculationPrice = parseFloat(ticker.bid || ticker.last || entryPrice);
+        } else {
+            calculationPrice = parseFloat(ticker.ask || ticker.last || entryPrice);
+        }
+    }
+    
+    // Calculate Gross PNL based on side
+    let grossPnl = 0;
+    if (side === 'long') {
+        grossPnl = (calculationPrice - entryPrice) * size;
+    } else {
+        grossPnl = (entryPrice - calculationPrice) * size;
+    }
+
+    // ⚡ INCLUDE FEES IN UNREALIZED PNL
+    // Taker fee on the exit value
+    const exitValue = calculationPrice * size;
+    const fee = exitValue * TAKER_FEE_RATE;
+    const netPnl = grossPnl - fee;
+    
+    // Calculate ROI based on margin used
+    // ROI = (Net PnL / Initial Margin) * 100
+    const margin = (size * entryPrice) / leverage;
+    const roi = margin > 0 ? (netPnl / margin) * 100 : 0;
+    
+    return { pnl: netPnl, roi, exitPrice: calculationPrice };
+}
+
+// ⚡⚡⚡ HELPER: ROUND TO NEAREST STEP SIZE ⚡⚡⚡
+function roundToStep(qty, stepSize) {
+    if(!stepSize || stepSize <= 0) return qty;
+    const inverse = 1.0 / stepSize;
+    let res = Math.round(qty * inverse) / inverse;
+    return parseFloat(res.toFixed(10)); // Clamp float errors
+}
+
+// ⚡⚡⚡ HELPER: SIMPLE MOVING AVERAGE (MOVED TO GLOBAL SCOPE FOR API USE) ⚡⚡⚡
+function calculateSMA(data, period) {
+    if (data.length < period) return 0;
+    return data.slice(-period).reduce((a, b) => a + b, 0) / period;
+}
+
+// ⚡⚡⚡ HELPER: AVERAGE TRUE RANGE (MOVED TO GLOBAL SCOPE FOR API USE) ⚡⚡⚡
+function calculateATR(candles, period) {
+    if (candles.length < period + 1) return 0;
+    const trs = [];
+    for(let i=1;i<candles.length;i++){
+        const high = candles[i][2], low = candles[i][3], prevClose = candles[i-1][4];
+        trs.push(Math.max(high-low, Math.abs(high-prevClose), Math.abs(low-prevClose)));
+    }
+    return trs.slice(-period).reduce((a,b)=>a+b,0)/period;
+}
+
+// ⚡⚡⚡ UPGRADED AI ENGINE: 5M HEIKIN ASHI TREND + REVERSAL DETECTOR ⚡⚡⚡
+function analyzeMarketSentiment(symbol, memory, history, candles) {
+    if (!candles || candles.length < 3) return { side: 'wait', accuracy: 50, mode: 'Insufficient Data', bias: 'Neutral' };
+
+    let haCandles = [];
+    for (let i = 0; i < candles.length; i++) {
+        const [time, open, high, low, close] = candles[i];
+        
+        let haClose = (open + high + low + close) / 4;
+        let haOpen;
+        
+        if (i === 0) {
+            haOpen = (open + close) / 2; // Base case
+        } else {
+            const prevHa = haCandles[i - 1];
+            haOpen = (prevHa.open + prevHa.close) / 2;
+        }
+        
+        const haHigh = Math.max(high, haOpen, haClose);
+        const haLow = Math.min(low, haOpen, haClose);
+        
+        haCandles.push({ open: haOpen, close: haClose, high: haHigh, low: haLow });
+    }
+
+    const current = haCandles[haCandles.length - 1];
+    
+    // 2. DETERMINE TREND
+    const isBullish = current.close > current.open;
+    const isBearish = current.close < current.open;
+    const bodySize = Math.abs(current.close - current.open);
+    const totalRange = current.high - current.low;
+    const upperWick = current.high - Math.max(current.open, current.close);
+    const lowerWick = Math.min(current.open, current.close) - current.low;
+
+    let finalSide = 'wait';
+    let bias = 'Neutral';
+    let mode = '5m HA Trend';
+    
+    // 3. DETECT "TOP/BOTTOM" REVERSAL OR EXHAUSTION
+    let isExhausted = false;
+
+    // Doji Detection (Indecision)
+    if (bodySize < (totalRange * 0.15)) {
+        isExhausted = true; // Spinning top or Doji -> Wait
+        mode = '5m HA Indecision (Wait)';
+    }
+
+    if (isBullish) {
+        bias = 'Bullish';
+        if (upperWick > (bodySize * 1.5)) {
+            isExhausted = true;
+            mode = '5m HA Top Detected (Wait)';
+        }
+        if (!isExhausted) finalSide = 'buy';
+    } else if (isBearish) {
+        bias = 'Bearish';
+        if (lowerWick > (bodySize * 1.5)) {
+            isExhausted = true;
+            mode = '5m HA Bottom Detected (Wait)';
+        }
+        if (!isExhausted) finalSide = 'sell';
+    }
+
+    // Override if exhausted
+    if (isExhausted) {
+        finalSide = 'wait';
+    }
+
+    let confidence = 85; 
+    if (isExhausted) confidence = 50;
+
+    return { side: finalSide, accuracy: confidence.toFixed(1), mode: mode, bias: bias };
+}
+
+// ⚡ NEW SIMPLE STRATEGY HELPER ⚡
+// Calculates basic Heikin Ashi trend for a given set of candles (no reversal logic)
+function getHeikinAshiDirection(candles) {
+    if (!candles || candles.length < 2) return 'wait';
+    let haOpen = (candles[0][1] + candles[0][4]) / 2;
+    let haClose = (candles[0][1] + candles[0][2] + candles[0][3] + candles[0][4]) / 4;
+    
+    // Iterate to get current HA
+    for(let i=1; i<candles.length; i++) {
+        const [t,o,h,l,c] = candles[i];
+        haOpen = (haOpen + haClose) / 2;
+        haClose = (o + h + l + c) / 4;
+    }
+    
+    if (haClose > haOpen) return 'buy';
+    if (haClose < haOpen) return 'sell';
+    return 'wait';
+}
+
+// 👻 GHOST SIMULATION ENGINE (AGGRESSIVE MODE) 👻
+function runGhostSimulation(user) {
+    if (Object.keys(GLOBAL_TICKERS).length === 0) return false;
+    if (!user.bot.ghostMemory) user.bot.ghostMemory = { wins: 0, total: 0, activeSims: [] };
+    const memory = user.bot.ghostMemory;
+    let updated = false;
+
+    for (let i = memory.activeSims.length - 1; i >= 0; i--) {
+        const sim = memory.activeSims[i];
+        const ticker = GLOBAL_TICKERS[sim.symbol];
+        if (!ticker) continue;
+
+        const currentPrice = ticker.last;
+        let pnlPct = 0;
+        
+        if (sim.side === 'buy') pnlPct = ((currentPrice - sim.entry) / sim.entry) * 100;
+        else pnlPct = ((sim.entry - currentPrice) / sim.entry) * 100;
+
+        if (pnlPct >= 0.15) {
+            memory.wins++;
+            memory.total++;
+            memory.activeSims.splice(i, 1);
+            updated = true;
+        } else if (pnlPct <= -0.1) {
+            memory.total++;
+            memory.activeSims.splice(i, 1);
+            updated = true;
+        } else if ((Date.now() - sim.time) > 900000) { 
+            memory.total++;
+            memory.activeSims.splice(i, 1);
+            updated = true;
+        }
+    }
+    return updated;
+}
+
+async function runBotLogic() {
+    if (isResetting) {
+        setTimeout(runBotLogic, 2000);
+        return;
+    }
+
+    try {
+        const users = await UserModel.find({});
+        if(users.length === 0) { setTimeout(runBotLogic, 2000); return; }
+
+        for (let rawUser of users) {
+            const user = await UserModel.findOne({ id: rawUser.id });
+            if (!user) continue;
+
+            sanitizeUser(user);
+            
+            const ghostUpdated = runGhostSimulation(user);
+            let dbUpdateNeeded = ghostUpdated;
+
+            if (user.bot.active !== true) {
+                if(dbUpdateNeeded) await saveUser(user);
+                continue;
+            }
+            
+            if (user.bot.coins.length === 0) continue;
+            
+            const config = user.bot;
+            const strategy = user.bot.strategy || 'neural'; // 'neural', 'ha_1m', 'ha_5m', 'ha_15m', 'ha_30m', 'ha_1h', 'fast_profit'
+            
+            const triggerRoi = parseFloat(config.triggerRoi || -15);
+            const recoveryRoi = parseFloat(config.recoveryRoi || -5);
+            const profitRoi = parseFloat(config.profitRoi || 2); 
+            const multiplier = parseFloat(config.tradeMultiplier || 1); 
+            // ⚡⚡⚡ STOP LOSS ENABLED (Default -10%) ⚡⚡⚡
+            const stopLossRoi = parseFloat(config.stopLossRoi || -10);
+            const gradualDcaRoi = parseFloat(config.gradualDcaRoi || -999);
+            const MAX_DCA_COUNT = 999999; 
+
+            let client = null;
+            try { 
+                client = getUserClient(user); 
+                await client.ensureMarkets(); 
+            } catch(e) { console.log(`Client Init Error (${user.username}):`, e.message); continue; }
+
+            let allPositions = []; try { allPositions = await client.fetchPositions(); } catch(e) {}
+            const balance = await client.fetchBalance(); const freeUsdt = parseFloat(balance.free.USDT || 0);
+            const history = user.mode === 'real' ? (user.real?.closedTrades || []) : (user.virtual?.closedTrades || []);
+
+            for (const target of config.coins) {
+                const currentDbUser = await UserModel.findOne({ id: user.id }, { 'bot.active': 1 });
+                if (!currentDbUser || !currentDbUser.bot || currentDbUser.bot.active !== true) {
+                    break; 
+                }
+
+                const symbol = target.symbol;
+                try {
+                    const clean = symbol.replace(/[^A-Z0-9]/g, '');
+                    const ticker = Object.values(GLOBAL_TICKERS).find(t => t.symbol.replace(/[^A-Z0-9]/g, '').includes(clean));
+                    let currentPrice = ticker ? ticker.last : 0;
+                    
+                    let pos = allPositions.find(p => p.symbol === symbol) || {};
+                    if(!pos.symbol && user.mode === 'real') { try { const specific = await client.fetchPositions([symbol]); pos = specific[0] || {}; } catch(err) {} }
+                    if(currentPrice === 0) continue;
+                    
+                    const size = parseFloat(pos.contracts || 0); 
+                    const entryPrice = parseFloat(pos.entryPrice || 0); 
+                    const lev = parseFloat(pos.leverage || config.leverage || 10);
+                    
+                    const pnlCalc = calculatePositionPNL(pos, ticker, user.mode);
+                    const currentUnrealizedPnl = pnlCalc.pnl;
+                    const currentRoi = pnlCalc.roi;
+
+                    let allowedToLose = false;
+
+                    // ⚡⚡⚡ EXHAUSTION DETECTION LOGIC (FAST PROFIT STRATEGY) ⚡⚡⚡
+                    let exhaustionState = 'none'; // 'none', 'overbought', 'oversold'
+                    if (strategy === 'fast_profit') {
+                        try {
+                            const cleanSym = symbol.split(':')[0];
+                            const candles = await publicClient.fetchOHLCV(cleanSym, '1m', undefined, 20);
+                            if (candles && candles.length >= 15) {
+                                const closes = candles.map(c => c[4]);
+                                const lastClose = closes[closes.length - 1];
+                                const sma = calculateSMA(closes, 14);
+                                const atr = calculateATR(candles, 14);
+                                const bandDist = 2.5 * atr;
+                                const upperBand = sma + bandDist;
+                                const lowerBand = sma - bandDist;
+
+                                if (lastClose > upperBand) exhaustionState = 'overbought';
+                                else if (lastClose < lowerBand) exhaustionState = 'oversold';
+                            }
+                        } catch(e) {}
+                    }
+                    
+                    // ⚡⚡⚡ TAKE PROFIT (Common to all strategies) ⚡⚡⚡
+                    if (size !== 0) {
+                        const configuredProfitRoi = parseFloat(config.profitRoi || 2);
+                        if (currentRoi >= configuredProfitRoi) {
+                            console.log(`[${user.username}] ✅ TAKE PROFIT: ${symbol} at ${currentRoi.toFixed(2)}%`); 
+                            await closePosition(client, symbol, pos); 
+                            target.lastAction = Date.now() + 60000; 
+                            target.dcaCount = 0; 
+                            target.baselineRoi = 0; 
+                            dbUpdateNeeded = true; 
+                            continue; 
+                        }
+                    }
+
+                    // ⚡⚡⚡ STOP LOSS ⚡⚡⚡
+                    if (size !== 0) {
+                         if (currentRoi <= stopLossRoi) {
+                             console.log(`[${user.username}] 🛑 STOP LOSS TRIGGERED: ${symbol} at ${currentRoi.toFixed(2)}%`);
+                             await closePosition(client, symbol, pos);
+                             target.lastAction = Date.now() + 60000;
+                             target.dcaCount = 0;
+                             target.baselineRoi = 0;
+                             dbUpdateNeeded = true;
+                             continue;
+                         }
+                    }
+
+                    // ⚡⚡⚡ AUTO-CLOSE & INSTANT REVERSE IF MAXED OUT ⚡⚡⚡
+                    if (size !== 0 && strategy === 'fast_profit') {
+                        let shouldCloseExhaustion = false;
+                        
+                        // ⚡ LOGIC FLIPPED: Short/Overbought -> Close/Flip, Long/Oversold -> Close/Flip
+                        if (pos.side === 'short' && exhaustionState === 'overbought') {
+                            shouldCloseExhaustion = true;
+                            console.log(`[${user.username}] ⚠️ EXHAUSTION (SHORT MAXED): Flipping ${symbol}`);
+                        } else if (pos.side === 'long' && exhaustionState === 'oversold') {
+                            shouldCloseExhaustion = true;
+                            console.log(`[${user.username}] ⚠️ EXHAUSTION (LONG MAXED): Flipping ${symbol}`);
+                        }
+
+                        if (shouldCloseExhaustion) {
+                            // 1. Close current
+                            await closePosition(client, symbol, pos);
+                            
+                            // 2. IMMEDIATE REVERSE ENTRY
+                            const reverseSide = pos.side === 'long' ? 'sell' : 'buy';
+                            
+                            let finalAmount = 0.001; 
+                            try { const market = client.market(symbol); if (market && market.limits && market.limits.amount && market.limits.amount.min) finalAmount = market.limits.amount.min; } catch(e) { finalAmount = 0.001; }
+                            finalAmount = finalAmount * multiplier;
+                            
+                            try {
+                                await client.setMarginMode('cross', symbol);
+                                await client.createOrder(symbol, 'market', reverseSide, finalAmount);
+                                console.log(`[${user.username}] 🔄 REVERSAL EXECUTED: ${reverseSide.toUpperCase()} ${symbol}`);
+                            } catch(err) { console.log("Reversal Error:", err.message); }
+
+                            target.lastAction = Date.now(); 
+                            target.dcaCount = 0;
+                            target.baselineRoi = 0;
+                            dbUpdateNeeded = true;
+                            continue; 
+                        }
+                    }
+
+                    if (size !== 0 && target.baselineRoi === undefined) { target.baselineRoi = currentRoi; dbUpdateNeeded = true; }
+                    
+                    // DCA LOGIC (Common to all strategies)
+                    if (size !== 0 && currentRoi <= triggerRoi) {
+                        const currentDcaCount = target.dcaCount || 0;
+                        if (currentDcaCount < MAX_DCA_COUNT) {
+                            if (!target.lastAction || (Date.now() - target.lastAction > 5000)) { 
+                                const targetRoiDec = recoveryRoi / 100; let targetAvgPrice = 0;
+                                if (pos.side === 'long') targetAvgPrice = currentPrice / (1 + (targetRoiDec / lev)); else targetAvgPrice = currentPrice / (1 - (targetRoiDec / lev));
+                                
+                                let qtyNeeded = (size * Math.abs(entryPrice - targetAvgPrice)) / Math.abs(targetAvgPrice - currentPrice);
+                                if (qtyNeeded < 0) qtyNeeded = 0; 
+                                
+                                let market = client.market(symbol);
+                                let stepSize = 0.001;
+                                if(market && market.limits && market.limits.amount && market.limits.amount.min) stepSize = market.limits.amount.min;
+                                
+                                let finalQty = roundToStep(qtyNeeded, stepSize);
+                                if (finalQty < stepSize) finalQty = stepSize;
+                                
+                                if (finalQty > 0 && isFinite(finalQty) && finalQty < 1000000) {
+                                    await client.setMarginMode('cross', symbol); 
+                                    const tradeSide = pos.side === 'long' ? 'buy' : 'sell';
+                                    const precision = stepSize.toString().split('.')[1]?.length || 0;
+                                    const safeQty = finalQty.toFixed(precision);
+                                    await client.createOrder(symbol, 'market', tradeSide, safeQty); 
+                                    target.lastAction = Date.now(); 
+                                    target.dcaCount = currentDcaCount + 1; 
+                                    dbUpdateNeeded = true; 
+                                }
+                                continue; 
+                            }
+                        }
+                    }
+                    if (size !== 0 && currentRoi <= gradualDcaRoi && currentRoi > triggerRoi) {
+                         if (!target.lastAction || (Date.now() - target.lastAction > 5000)) {
+                             let minQty = 0.001; try { const market = client.market(symbol); if (market && market.limits && market.limits.amount && market.limits.amount.min) minQty = market.limits.amount.min; } catch(e) { minQty = 0.001; }
+                             await client.setMarginMode('cross', symbol); 
+                             const tradeSide = pos.side === 'long' ? 'buy' : 'sell';
+                             await client.createOrder(symbol, 'market', tradeSide, minQty); 
+                             target.lastAction = Date.now(); dbUpdateNeeded = true; continue;
+                         }
+                    }
+                    
+                    // ⚡⚡⚡ ENTRY LOGIC (STRATEGY SWITCHER) ⚡⚡⚡
+                    if(size === 0) {
+                        if(target.baselineRoi !== 0) { target.baselineRoi = 0; dbUpdateNeeded = true; }
+                        
+                        // Limit API calls: Only check every 3s
+                        if (!target.lastAction || (Date.now() - target.lastAction > 3000)) {
+                            
+                            let finalSide = 'wait';
+                            
+                            if (strategy === 'neural') {
+                                // --- STRATEGY 1: NEURAL HYBRID (5m HA + Reversal) ---
+                                let candles = [];
+                                try {
+                                    const cleanSym = symbol.split(':')[0];
+                                    candles = await publicClient.fetchOHLCV(cleanSym, '5m', undefined, 5);
+                                } catch(err) { try { candles = await publicClient.fetchOHLCV(symbol, '5m', undefined, 5); } catch(e2) {} }
+
+                                const aiStats = analyzeMarketSentiment(symbol, user.bot.learningMemory, history, candles);
+                                user.bot.aiStats = { accuracy: aiStats.accuracy, mode: aiStats.mode, bias: aiStats.bias }; 
+                                dbUpdateNeeded = true;
+                                finalSide = aiStats.side;
+                                
+                                const isReversalWait = aiStats.mode.includes('Top Detected') || aiStats.mode.includes('Bottom Detected');
+                                if (finalSide === 'wait' && !isReversalWait && ticker && ticker.open) {
+                                    if (ticker.last > ticker.open) finalSide = 'buy'; else finalSide = 'sell';
+                                    user.bot.aiStats.mode = 'Trend Fallback';
+                                }
+                            } 
+                            else if (strategy === 'fast_profit') {
+                                // --- STRATEGY: FAST PROFIT (SMA + ATR + EXHAUSTION REVERSAL) ---
+                                // ⚡ LOGIC FLIPPED AS REQUESTED (Long -> Short, Short -> Long)
+                                
+                                if (exhaustionState === 'overbought') {
+                                    finalSide = 'buy'; // Flipped (was sell)
+                                    user.bot.aiStats = { accuracy: "N/A", mode: "Exhaustion Reversal (Long)", bias: "Bullish" };
+                                    dbUpdateNeeded = true;
+                                } else if (exhaustionState === 'oversold') {
+                                    finalSide = 'sell'; // Flipped (was buy)
+                                    user.bot.aiStats = { accuracy: "N/A", mode: "Exhaustion Reversal (Short)", bias: "Bearish" };
+                                    dbUpdateNeeded = true;
+                                } else {
+                                    // STANDARD TREND FLIPPED (Counter-Trend)
+                                    const ATR_PERIOD = 14;
+                                    let candles = [];
+                                    try { const cleanSym = symbol.split(':')[0]; candles = await publicClient.fetchOHLCV(cleanSym, '1m', undefined, 20); } catch(err) {}
+                                    
+                                    if (candles.length >= ATR_PERIOD + 1) {
+                                        const closes = candles.map(c => c[4]);
+                                        const lastClose = closes[closes.length - 1];
+                                        const smaValue = calculateSMA(closes, ATR_PERIOD);
+                                        
+                                        // Flipped Logic
+                                        if (lastClose > smaValue) finalSide = 'sell'; // Flipped (was buy)
+                                        else if (lastClose < smaValue) finalSide = 'buy'; // Flipped (was sell)
+                                        
+                                        user.bot.aiStats = { accuracy: "N/A", mode: "Fast Profit (SMA)", bias: finalSide === 'buy' ? 'Bullish' : 'Bearish' };
+                                        dbUpdateNeeded = true;
+                                    }
+                                }
+                            }
+                            else if (strategy === 'ha_1m') {
+                                // --- STRATEGY 2: 1m HEIKIN ASHI FOLLOWER ---
+                                let candles = [];
+                                try {
+                                    const cleanSym = symbol.split(':')[0];
+                                    candles = await publicClient.fetchOHLCV(cleanSym, '1m', undefined, 5);
+                                } catch(err) { try { candles = await publicClient.fetchOHLCV(symbol, '1m', undefined, 5); } catch(e2) {} }
+                                
+                                finalSide = getHeikinAshiDirection(candles);
+                                user.bot.aiStats = { accuracy: "N/A", mode: "1m HA Follower", bias: finalSide === 'buy' ? 'Bullish' : (finalSide === 'sell' ? 'Bearish' : 'Neutral') };
+                                dbUpdateNeeded = true;
+                            }
+                            else if (strategy === 'ha_5m') {
+                                // --- STRATEGY 3: 5m HEIKIN ASHI FOLLOWER ---
+                                let candles = [];
+                                try {
+                                    const cleanSym = symbol.split(':')[0];
+                                    candles = await publicClient.fetchOHLCV(cleanSym, '5m', undefined, 5);
+                                } catch(err) { try { candles = await publicClient.fetchOHLCV(symbol, '5m', undefined, 5); } catch(e2) {} }
+                                
+                                finalSide = getHeikinAshiDirection(candles);
+                                user.bot.aiStats = { accuracy: "N/A", mode: "5m HA Follower", bias: finalSide === 'buy' ? 'Bullish' : (finalSide === 'sell' ? 'Bearish' : 'Neutral') };
+                                dbUpdateNeeded = true;
+                            }
+                            else if (strategy === 'ha_15m') {
+                                // --- STRATEGY 4: 15m HEIKIN ASHI FOLLOWER ---
+                                let candles = [];
+                                try {
+                                    const cleanSym = symbol.split(':')[0];
+                                    candles = await publicClient.fetchOHLCV(cleanSym, '15m', undefined, 5);
+                                } catch(err) { try { candles = await publicClient.fetchOHLCV(symbol, '15m', undefined, 5); } catch(e2) {} }
+                                
+                                finalSide = getHeikinAshiDirection(candles);
+                                user.bot.aiStats = { accuracy: "N/A", mode: "15m HA Follower", bias: finalSide === 'buy' ? 'Bullish' : (finalSide === 'sell' ? 'Bearish' : 'Neutral') };
+                                dbUpdateNeeded = true;
+                            }
+                            else if (strategy === 'ha_30m') {
+                                // --- STRATEGY 5: 30m HEIKIN ASHI FOLLOWER ---
+                                let candles = [];
+                                try {
+                                    const cleanSym = symbol.split(':')[0];
+                                    candles = await publicClient.fetchOHLCV(cleanSym, '30m', undefined, 5);
+                                } catch(err) { try { candles = await publicClient.fetchOHLCV(symbol, '30m', undefined, 5); } catch(e2) {} }
+                                
+                                finalSide = getHeikinAshiDirection(candles);
+                                user.bot.aiStats = { accuracy: "N/A", mode: "30m HA Follower", bias: finalSide === 'buy' ? 'Bullish' : (finalSide === 'sell' ? 'Bearish' : 'Neutral') };
+                                dbUpdateNeeded = true;
+                            }
+                            else if (strategy === 'ha_1h') {
+                                // --- STRATEGY 6: 1H HEIKIN ASHI FOLLOWER ---
+                                let candles = [];
+                                try {
+                                    const cleanSym = symbol.split(':')[0];
+                                    candles = await publicClient.fetchOHLCV(cleanSym, '1h', undefined, 5);
+                                } catch(err) { try { candles = await publicClient.fetchOHLCV(symbol, '1h', undefined, 5); } catch(e2) {} }
+                                
+                                finalSide = getHeikinAshiDirection(candles);
+                                user.bot.aiStats = { accuracy: "N/A", mode: "1H HA Follower", bias: finalSide === 'buy' ? 'Bullish' : (finalSide === 'sell' ? 'Bearish' : 'Neutral') };
+                                dbUpdateNeeded = true;
+                            }
+
+                            // EXECUTE ENTRY
+                            if (finalSide === 'buy' || finalSide === 'sell') {
+                                let finalAmount = 0.001; 
+                                try { const market = client.market(symbol); if (market && market.limits && market.limits.amount && market.limits.amount.min) finalAmount = market.limits.amount.min; } catch(e) { finalAmount = 0.001; }
+                                
+                                finalAmount = finalAmount * multiplier; 
+                                const myMinCost = (currentPrice * finalAmount) / lev;
+                                
+                                if (freeUsdt >= myMinCost) { 
+                                    try { await client.setLeverage(lev, symbol); } catch(e){}
+                                    await client.setMarginMode('cross', symbol);
+                                    
+                                    await client.createOrder(symbol, 'market', finalSide, finalAmount);
+                                    console.log(`[${user.username}] 🧠 INSTANT ENTRY: ${finalSide.toUpperCase()} on ${symbol} (${strategy})`);
+                                    
+                                    target.lastAction = Date.now(); 
+                                    target.dcaCount = 0; 
+                                    target.baselineRoi = 0; 
+                                    dbUpdateNeeded = true;
+                                }
+                            }
+                        }
+                    }
+                } catch (e) { console.log(`⚠️ BOT ERROR [${symbol}]: ${e.message}`); }
+            }
+            if(dbUpdateNeeded) await saveUser(user);
+        }
+    } catch (criticalError) { 
+        console.error("❌ CRITICAL BOT ERROR:", criticalError.message); 
+    }
+    setTimeout(runBotLogic, 2000);
+}
+
+// ==========================================
+// 6. HELPER FUNCTIONS (NEWS FETCH HERE)
+// ==========================================
+function getUserClient(user) {
+    // ⚡ DIRECT DB FIX: No Cache. Always fresh instance.
+    if (user.mode === 'real') {
+        if (!user.realKeys.apiKey || !user.realKeys.secret) throw new Error("Real API Keys not set");
+        const client = new RealClientWrapper(user.realKeys.apiKey, user.realKeys.secret);
+        client.parentUser = user; 
+        return client;
+    } else { 
+        // Virtual Client is just a state wrapper, so new instance is fine.
+        return new VirtualClient(user);
+    }
+}
+
+async function closePosition(client, symbol, pos = null) {
+    if (!pos) { const positions = await client.fetchPositions([symbol]); pos = positions.find(p => p.symbol === symbol); }
+    if (!pos || parseFloat(pos.contracts) === 0) return; 
+    const size = parseFloat(pos.contracts); const entry = parseFloat(pos.entryPrice); const side = pos.side; const leverage = parseFloat(pos.leverage);
+    
+    // Use fixed PNL calculation for closing with BID/ASK
+    const ticker = GLOBAL_TICKERS[symbol] || await client.fetchTicker(symbol);
+    const pnlCalc = calculatePositionPNL(pos, ticker, client instanceof RealClientWrapper ? 'real' : 'virtual');
+    const closePrice = pnlCalc.exitPrice;
+    const pnl = pnlCalc.pnl;
+    const roi = pnlCalc.roi;
+    
+    console.log(`[CLOSE] ${symbol} - Side: ${side}, Entry: ${entry}, Close: ${closePrice}, PnL: ${pnl}, ROI: ${roi}%`);
+    
+    if (client instanceof RealClientWrapper) {
+        let vol = 0;
+        try { const candles = await publicClient.fetchOHLCV(symbol, '1m', undefined, 3); if(candles && candles.length > 0) { let maxH = 0; let minL = Infinity; candles.forEach(c => { if(c[2] > maxH) maxH = c[2]; if(c[3] < minL && c[3] > 0) minL = c[3]; }); if(maxH > 0 && minL !== Infinity) vol = ((maxH - minL) / minL) * 100; } } catch(e) {}
+        if (client.parentUser) {
+            if (!client.parentUser.real) client.parentUser.real = {};
+            if (!client.parentUser.real.closedTrades) client.parentUser.real.closedTrades = [];
+            client.parentUser.real.closedTrades.unshift({ timestamp: Date.now(), symbol: symbol, side: side, qty: size, entry: entry, close: closePrice, pnl: pnl, roi: roi, volatility: vol || 0, status: 'CLOSED' });
+            if (client.parentUser.real.closedTrades.length > 50) client.parentUser.real.closedTrades.pop();
+            if(!client.parentUser.bot.learningMemory) client.parentUser.bot.learningMemory = { wins: 0, total: 0 };
+            client.parentUser.bot.learningMemory.total = (client.parentUser.bot.learningMemory.total || 0) + 1;
+            if(pnl > 0) client.parentUser.bot.learningMemory.wins = (client.parentUser.bot.learningMemory.wins || 0) + 1;
+        }
+        return await client.closePosition(symbol);
+    }
+    const closeSide = pos.side === 'long' ? 'sell' : 'buy';
+    return await client.createOrder(symbol, 'market', closeSide, pos.contracts);
+}
+
+function slugify(text) { if(!text) return 'article'; return text.toString().toLowerCase().replace(/\s+/g, '-').replace(/[^\w\-]+/g, '').replace(/\-\-+/g, '-'); }
+
+// [NEWS LOGIC] - Helper function to fetch news from cache or API
+function getNewsData(cb) {
+    const now = Date.now();
+    if (newsCache.length > 0 && (now - lastNewsFetch) < 15 * 60 * 1000) return cb(newsCache);
+    const newsUrl = `https://newsapi.org/v2/everything?q=cryptocurrency&sortBy=publishedAt&language=en&apiKey=${NEWS_API_KEY}`;
+    https.get(newsUrl, { headers: { 'User-Agent': 'Node.js' } }, (res) => {
+        let data = ''; res.on('data', chunk => data += chunk);
+        res.on('end', () => { try { const parsed = JSON.parse(data); if(parsed.articles) { newsCache = parsed.articles; lastNewsFetch = now; } cb(newsCache || []); } catch(e) { cb(newsCache || []); } });
+    }).on('error', () => cb(newsCache || []));
+}
+
+function getTrackingScript() {
+    return `<script src="/socket.io/socket.io.js"></script>
+    <script>
+        const trackingSocket = io();
+        const pagePath = window.location.pathname;
+        document.addEventListener('click', (e) => {
+            let target = e.target;
+            let text = target.innerText || target.value || target.id || 'Unknown';
+            if(text.length > 50) text = text.substring(0,50) + '...';
+            trackingSocket.emit('user_click', { page: pagePath, text: text, tag: target.tagName });
+        });
+        setInterval(() => {
+            const scroll = Math.round((window.scrollY / (document.body.scrollHeight - window.innerHeight)) * 100) || 0;
+            trackingSocket.emit('tracking_data', { page: pagePath, scrollPercent: scroll });
+        }, 2000);
+        
+        // MOBILE MENU TOGGLE
+        function toggleMobileMenu() {
+            const nav = document.getElementById('navLinks');
+            nav.classList.toggle('active');
+        }
+    </script>`;
+}
+
+// ------------------------------------------------
+// UI RENDERER (INCLUDES TOAST LOGIC & MOBILE MENU)
+// ------------------------------------------------
+function renderLayout(title, content, user, meta = {}) {
+    const isReal = user && user.mode === 'real';
+    const headerColor = isReal ? '#c62828' : '#6200ea';
+    const modeName = isReal ? 'REAL HITBTC' : 'VIRTUAL';
+    
+    // AI Stats
+    const aiAccuracy = user && user.bot && user.bot.aiStats ? user.bot.aiStats.accuracy : '50.0';
+    const aiStats = user && user.bot && user.bot.aiStats ? user.bot.aiStats : { accuracy: 50, mode: 'Learning', bias: 'Neutral' };
+    const accColor = parseFloat(aiAccuracy) > 50 ? 'var(--green)' : 'var(--text-secondary)';
+
+    // --- AI LEARNING STATUS LOGIC ---
+    const totalTrades = user && user.bot && user.bot.learningMemory ? user.bot.learningMemory.total : 0;
+    const learningTarget = 50; 
+    const learningPct = Math.min((totalTrades / learningTarget) * 100, 100).toFixed(0);
+    const isLearning = totalTrades < learningTarget;
+    const remaining = Math.max(0, learningTarget - totalTrades);
+    
+    // 👻 GHOST STATS 👻
+    const ghostMem = user && user.bot && user.bot.ghostMemory ? user.bot.ghostMemory : { wins: 0, total: 0 };
+    const ghostAcc = ghostMem.total > 0 ? ((ghostMem.wins / ghostMem.total) * 100).toFixed(1) : "0.0";
+    const ghostCount = ghostMem.total;
+
+    // -------------------------------
+
+    let newsTicker = '';
+    if(newsCache && newsCache.length > 0) {
+        const safeNews = newsCache.filter(n => n.title).slice(0, 5);
+        if(safeNews.length > 0) {
+            newsTicker = `<div style="background:#000; color:#00e676; white-space:nowrap; overflow:hidden; font-size:0.8rem; padding:6px 0; border-bottom:1px solid #222;">
+                <div style="display:inline-block; animation:ticker 30s linear infinite; padding-left:100%;">
+                    <span style="font-weight:bold; color:white; margin-right:10px;">⚡ NEWS:</span>
+                    ${safeNews.map(n => `<a href="/news/view/${slugify(n.title)}" style="color:#00e676; text-decoration:none; margin-right:30px; font-weight:bold;">${n.title}</a>`).join('')}
+                </div>
+            </div>
+            <style>@keyframes ticker { 0% { transform: translate3d(0, 0, 0); } 100% { transform: translate3d(-100%, 0, 0); } }</style>`;
+        }
+    }
+
+    return `
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+        <title>${title} | HitBTC Bot</title>
+        <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&family=Roboto+Mono:wght@500&display=swap" rel="stylesheet">
+        <!-- Chart.js CDNs for Heikin Ashi -->
+        <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/luxon@3.0.1/build/global/luxon.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon@1.2.0/dist/chartjs-adapter-luxon.min.js"></script>
+        <style>
+            :root { 
+                --primary: ${headerColor}; 
+                --bg: #f0f2f5; 
+                --surface: #ffffff; 
+                --text: #202124; 
+                --text-secondary: #5f6368; 
+                --green: #2e7d32; 
+                --red: #c62828; 
+                --border: #dadce0;
+                --shadow-1: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.24);
+                --shadow-2: 0 3px 6px rgba(0,0,0,0.16), 0 3px 6px rgba(0,0,0,0.23);
+                --radius: 8px;
+            }
+            body { 
+                background: var(--bg); 
+                color: var(--text); 
+                font-family: 'Roboto', sans-serif; 
+                margin: 0; 
+                padding: 0; 
+                height: 100vh; 
+                display: flex; 
+                flex-direction: column; 
+                overflow-x: hidden;
+            }
+            header { 
+                background: var(--primary); 
+                height: 60px; 
+                display: flex; 
+                align-items: center; 
+                justify-content: space-between; 
+                padding: 0 24px; 
+                box-shadow: var(--shadow-2); 
+                flex-shrink: 0; 
+                z-index: 1000; 
+                position: relative;
+            }
+            .logo { 
+                font-weight: 700; 
+                font-size: 1.25rem; 
+                color: white; 
+                text-decoration: none; 
+                display: flex; 
+                align-items: center; 
+                gap: 10px; 
+            }
+            .header-right a { 
+                color: rgba(255,255,255,0.9); 
+                text-decoration: none; 
+                margin-left: 20px; 
+                font-size: 0.9rem; 
+                font-weight: 500; 
+                text-transform: uppercase; 
+                letter-spacing: 0.5px; 
+            }
+            .menu-toggle { display: none; flex-direction: column; cursor: pointer; gap: 5px; margin-right: 15px; }
+            .menu-toggle div { width: 25px; height: 3px; background: white; }
+            
+            .card { 
+                background: var(--surface); 
+                border-radius: var(--radius); 
+                box-shadow: var(--shadow-1); 
+                padding: 16px; 
+                transition: 0.3s; 
+                border: none; 
+                position: relative; 
+                display: flex; 
+                flex-direction: column; 
+                box-sizing: border-box; 
+                overflow: visible; /* FIXED: Changed from hidden to visible */
+                flex-shrink: 0; /* FIXED: Prevent cards from shrinking */
+            }
+            
+            /* Desktop Grid Layout */
+            .container { 
+                flex: 1; 
+                display: grid; 
+                grid-template-columns: 320px 1fr 360px; 
+                grid-template-rows: 60px 1fr 340px; 
+                gap: 16px; 
+                padding: 16px; 
+                overflow: hidden; 
+                height: calc(100vh - 60px); /* Fill remaining height exactly */
+                box-sizing: border-box; 
+                position: relative;
+            }
+            
+            .ticker-bar { grid-column: 1 / 4; grid-row: 1; display: flex; flex-direction: row; align-items: center; justify-content: space-between; padding: 0 24px; z-index: 10; }
+            .order-book { grid-column: 1; grid-row: 2 / 4; height: 100%; overflow: hidden; padding: 0; display: flex; flex-direction: column; }
+            .chart-area { grid-column: 2; grid-row: 2; height: 100%; padding: 0; overflow: hidden; min-height: 0; display: flex; flex-direction: column; }
+            .orders-panel { grid-column: 2; grid-row: 3; height: 100%; overflow: hidden; padding: 0; display: flex; flex-direction: column; }
+            
+            /* SIDEBAR SCROLL FIX APPLIED HERE */
+            .sidebar { 
+                grid-column: 3; 
+                grid-row: 2 / 4; 
+                overflow-y: auto; /* Vertical scroll allowed */
+                overflow-x: hidden; /* No horizontal scroll */
+                display: flex; 
+                flex-direction: column; 
+                gap: 16px; 
+                padding-bottom: 50px; 
+                height: 100%; 
+                max-height: 100%; /* Ensure it stays within grid row */
+                min-height: 0; /* Flexbox scroll fix */
+                scrollbar-width: thin; 
+            }
+            /* Webkit Scrollbar Styling for Visibility */
+            .sidebar::-webkit-scrollbar { width: 6px; }
+            .sidebar::-webkit-scrollbar-track { background: transparent; }
+            .sidebar::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.2); border-radius: 4px; }
+            .sidebar::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.3); }
+            
+            /* Responsive Mobile Layout */
+            @media (max-width: 1000px) {
+                body { overflow-y: auto; height: auto; }
+                .menu-toggle { display: flex; }
+                .header-right { 
+                    display: none; 
+                    position: absolute; 
+                    top: 60px; 
+                    left: 0; 
+                    width: 100%; 
+                    background: var(--primary); 
+                    flex-direction: column; 
+                    padding: 10px 0; 
+                    box-shadow: 0 4px 6px rgba(0,0,0,0.2);
+                }
+                .header-right.active { display: flex; }
+                .header-right a { margin: 5px 0; text-align: center; display: block; width: 100%; padding: 12px 0; border-bottom: 1px solid rgba(255,255,255,0.1); }
+                
+                .container { 
+                    display: flex; 
+                    flex-direction: column; 
+                    gap: 12px; 
+                    padding: 12px; 
+                    height: auto;
+                    min-height: auto;
+                }
+                .sidebar { padding-bottom: 40px; overflow: visible; height: auto; max-height: none; order: 3; }
+                .chart-area { min-height: 400px; order: 1; }
+                .orders-panel { min-height: 400px; order: 4; }
+                .order-book { display: none; } /* Hide orderbook on mobile to save space */
+                .ticker-bar { flex-wrap: wrap; gap: 10px; padding: 12px; height: auto; order: 0; }
+                .card { padding: 12px; } /* Smaller padding for mobile cards */
+                
+                /* Increase touch targets */
+                input, select, button { min-height: 40px; font-size: 16px; } 
+            }
+
+            .ob-header { display: flex; padding: 10px 16px; background: #fafafa; font-size: 0.75rem; color: var(--text-secondary); font-weight: 500; text-transform: uppercase; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+            #asks, #bids { flex: 1; overflow-y: auto; overflow-x: hidden; min-height: 0; }
+            #asks { display: flex; flex-direction: column-reverse; }
+            .spread-bar { padding: 8px; text-align: center; font-weight: bold; font-family: 'Roboto Mono', monospace; background: #fafafa; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+            
+            .tradingview-widget-container { height: 60%; width: 100%; position: relative; min-height: 250px; }
+            /* FIXED CHART CONTAINER */
+            .heikin-ashi-container { flex: 1; width: 100%; position: relative; padding-top: 10px; border-top: 1px solid #eee; display: flex; flex-direction: column; min-height: 300px; }
+            
+            .order-tabs { display: flex; border-bottom: 1px solid var(--border); background: white; flex-shrink: 0; overflow-x: auto; }
+            .order-tab-item { padding: 14px 20px; font-size: 0.85rem; font-weight: 500; text-transform: uppercase; color: var(--text-secondary); cursor: pointer; border-bottom: 2px solid transparent; transition: 0.2s; white-space: nowrap; }
+            .order-tab-item.active { color: var(--primary); border-bottom-color: var(--primary); }
+            
+            #view-active, #view-filled, #view-positions, #view-closed { flex: 1; overflow-y: auto; min-height: 0; }
+            
+            table { width: 100%; border-collapse: collapse; }
+            th { text-align: left; font-size: 0.75rem; color: var(--text-secondary); font-weight: 500; text-transform: uppercase; padding: 12px 16px; border-bottom: 1px solid var(--border); background: #fafafa; position: sticky; top: 0; z-index: 5; }
+            td { padding: 10px 16px; font-size: 0.85rem; border-bottom: 1px solid #f0f0f0; }
+            
+            .virtual-banner { background: #323232; color: #fff; text-align: center; font-size: 0.75rem; padding: 6px; font-weight: 500; letter-spacing: 0.5px; z-index: 2000; position: relative; flex-shrink: 0; }
+            
+            #toast-container { position: fixed; top: 20px; right: 20px; z-index: 3000; display: flex; flex-direction: column; gap: 10px; }
+            .toast { background: white; color: var(--text); padding: 12px 20px; border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); display: flex; align-items: center; gap: 10px; animation: slideIn 0.3s ease-out; border-left: 5px solid; min-width: 250px; font-size: 0.9rem; font-weight: 500; }
+            .toast-success { border-left-color: var(--green); }
+            .toast-error { border-left-color: var(--red); }
+            @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+            @keyframes fadeOut { from { opacity: 1; } to { opacity: 0; } }
+            
+            /* AUTH CONTAINER (LOGIN/REGISTER OPTIMIZATION) */
+            .auth-container { display: flex; justify-content: center; align-items: center; min-height: 80vh; padding: 20px; }
+            .auth-card { width: 100%; max-width: 400px; text-align: center; }
+            
+            /* UTILITY */
+            h3 { font-size: 1rem; font-weight: 500; color: var(--text-secondary); margin: 0 0 16px 0; text-transform: uppercase; letter-spacing: 0.5px; }
+            .data-val-lg { font-size: 1.5rem; font-weight: 400; color: var(--text); }
+            .data-label { font-size: 0.75rem; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.5px; font-weight: 500; }
+            .btn { width: 100%; padding: 12px 16px; border: none; border-radius: 4px; font-weight: 500; cursor: pointer; color: #fff; font-size: 0.9rem; text-transform: uppercase; letter-spacing: 0.75px; box-shadow: 0 2px 2px 0 rgba(0,0,0,0.14), 0 1px 5px 0 rgba(0,0,0,0.12); transition: 0.2s; position: relative; overflow: hidden; }
+            .btn:active { box-shadow: none; transform: translateY(1px); }
+            .btn-primary { background: var(--primary); }
+            .btn-buy { background: var(--green); }
+            .btn-sell { background: var(--red); }
+            .btn-text { background: transparent; color: var(--primary); box-shadow: none; width: auto; padding: 6px 12px; }
+            .btn-text:hover { background: rgba(0,0,0,0.04); }
+            .input-group { position: relative; background: #f5f5f5; border-radius: 4px 4px 0 0; border-bottom: 2px solid transparent; margin-bottom: 12px; transition: background 0.2s; }
+            .input-group:hover { background: #ececec; }
+            .input-group:focus-within { background: #e8e8e8; border-bottom-color: var(--primary); }
+            .input-group label { position: absolute; top: 8px; left: 12px; font-size: 0.7rem; color: var(--text-secondary); font-weight: 500; }
+            .input-group input, .input-group select { width: 100%; border: none; background: transparent; padding: 24px 12px 6px; font-size: 1rem; color: var(--text); outline: none; box-sizing: border-box; font-family: 'Roboto', sans-serif; }
+            .tabs { display: flex; background: #e0e0e0; padding: 4px; border-radius: 4px; margin-bottom: 16px; }
+            .tab { flex: 1; text-align: center; padding: 8px; font-size: 0.85rem; font-weight: 500; text-transform: uppercase; color: var(--text-secondary); cursor: pointer; border-radius: 4px; transition: 0.2s; }
+            .tab.active { background: white; color: var(--primary); box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+            .stat-row { display: flex; justify-content: space-between; align-items: baseline; padding: 10px 0; border-bottom: 1px solid #f0f0f0; }
+            .stat-row:last-child { border-bottom: none; }
+            .text-green { color: var(--green); } 
+            .text-red { color: var(--red); }
+            .chip { display: inline-flex; align-items: center; padding: 4px 8px; border-radius: 16px; background: #e0e0e0; font-size: 0.75rem; margin-right: 4px; margin-bottom: 4px; font-weight: 500; }
+            .chip-action { cursor: pointer; background: #e8f0fe; color: var(--primary); }
+            
+            /* Chart controls */
+            .chart-controls { display: flex; gap: 5px; margin-bottom: 5px; overflow-x: auto; padding-bottom: 5px; }
+            .chart-btn { padding: 4px 8px; font-size: 0.7rem; border: 1px solid #eee; background: white; cursor: pointer; border-radius: 4px; }
+            .chart-btn.active { background: var(--primary); color: white; border-color: var(--primary); }
+        </style>
+        <script>
+            // TOAST FUNCTION
+            function showToast(message, isError = false) {
+                const container = document.getElementById('toast-container');
+                const toast = document.createElement('div');
+                toast.className = 'toast ' + (isError ? 'toast-error' : 'toast-success');
+                toast.innerHTML = (isError ? '❌ ' : '✅ ') + message;
+                container.appendChild(toast);
+                setTimeout(() => {
+                    toast.style.animation = 'fadeOut 0.5s ease-out forwards';
+                    setTimeout(() => toast.remove(), 500);
+                }, 3000);
+            }
+
+            // AJAX Functions - NOW NO RELOAD
+            function addCoin(symbol) { 
+                fetch('/bot/add', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ symbol }) })
+                .then(r => r.json())
+                .then(d => { 
+                    if(d.success) showToast('Coin Added Successfully');
+                    else showToast('Failed to Add Coin', true);
+                }); 
+            }
+            function addAllCoins() { 
+                if(confirm('Add ALL supported coins?')) {
+                    fetch('/bot/add-all', { method: 'POST' })
+                    .then(r => r.json())
+                    .then(d => {
+                         if(d.success) showToast('All Coins Added');
+                    });
+                }
+            }
+            function removeCoin(symbol) { 
+                fetch('/bot/remove', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ symbol }) })
+                .then(r => r.json())
+                .then(d => { 
+                    if(d.success) showToast('Coin Removed');
+                }); 
+            }
+            function clearCoins() { fetch('/bot/clear', { method: 'POST' }).then(() => showToast('All Coins Cleared')); }
+            function setBalance() { 
+                const amount = prompt("Enter new Virtual Wallet Balance:"); 
+                if(amount && !isNaN(amount)) { fetch('/api/set-balance', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ amount }) }).then(() => showToast('Balance Updated')); } 
+            }
+            function switchMode() { 
+                if(confirm("Switch Trading Mode (Virtual <-> Real HitBTC)?")) {
+                    fetch('/api/switch-mode', { method: 'POST' })
+                    .then(r=>r.json())
+                    .then(d => { if(d.success) location.reload(); });
+                }
+            }
+            function updateBotSettings(e) { 
+                e.preventDefault(); 
+                const formData = new FormData(e.target); 
+                const data = Object.fromEntries(formData.entries()); 
+                // Don't toggle active state, just save numbers
+                fetch('/bot/update-settings', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data) })
+                .then(r => r.json())
+                .then(d => { 
+                    if(d.success) showToast('Settings Saved to Cloud!');
+                    else showToast('Save Failed', true);
+                }); 
+            }
+            
+            function toggleBotEngine() {
+                fetch('/bot/toggle', { method: 'POST' })
+                .then(r => r.json())
+                .then(d => {
+                    if(d.success) {
+                        if(d.active) showToast('ENGINE STARTED');
+                        else showToast('ENGINE STOPPED', true);
+                    }
+                });
+            }
+
+            function resetPnl() { if(confirm('Reset Realized PnL and History?')) fetch('/api/reset-pnl', { method: 'POST' }).then(() => showToast('PnL Reset')); }
+            function resetMaxMargin() { if(confirm('Reset Max Margin Stat?')) fetch('/api/reset-max-margin', { method: 'POST' }).then(() => showToast('Max Margin Reset')); }
+            function triggerDCA(symbol) {
+                if(confirm('Trigger Immediate DCA Buy for ' + symbol + '?')) {
+                    fetch('/bot/manual-dca', { 
+                        method: 'POST', 
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ symbol })
+                    })
+                    .then(r => r.json())
+                    .then(d => { 
+                        if(d.success) showToast('DCA Executed!'); 
+                        else showToast('Failed: ' + d.message, true); 
+                    });
+                }
+            }
+
+            // Tab switching functions
+            let currentView = 'active';
+
+            window.switchOrderTab = function(view) {
+                currentView = view;
+                document.querySelectorAll('.order-tab-item').forEach(e => e.classList.remove('active'));
+                document.getElementById('tab-' + view).classList.add('active');
+                ['active','filled','positions','closed'].forEach(v => document.getElementById('view-'+v).style.display = 'none');
+                document.getElementById('view-' + view).style.display = 'block';
+                refreshCurrentTab();
+            }
+
+            function refreshCurrentTab() {
+                if(currentView === 'active') fetchOrders(); 
+                else if(currentView === 'filled') fetchHistory();
+                else if(currentView === 'positions') fetchPositions();
+                else if(currentView === 'closed') fetchClosed();
+            }
+
+            function closeSpecific(symbol) {
+                if(confirm('Close position for ' + symbol + '?')) {
+                    fetch('/api/close', { 
+                        method: 'POST', 
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ symbol: symbol }) 
+                    }).then(() => { 
+                        showToast('Position Closed'); 
+                        refreshCurrentTab(); 
+                    });
+                }
+            }
+        </script>
+    </head>
+    <body>
+        <div id="toast-container"></div>
+        <div class="virtual-banner">CURRENT MODE: ${modeName} - ${isReal ? '⚠️ REAL FUNDS AT RISK' : 'SIMULATION ONLY'}</div>
+        ${newsTicker}
+        <header>
+            <div style="display:flex; align-items:center;">
+                <div class="menu-toggle" onclick="toggleMobileMenu()"><div></div><div></div><div></div></div>
+                <a href="/" class="logo">⚡ HitBTC Bot</a>
+            </div>
+            <div class="header-right" id="navLinks">
+                <a href="/">Dashboard</a>
+                <a href="/news">News</a>
+                <a onclick="switchMode()" style="cursor:pointer; background:rgba(255,255,255,0.2); padding:4px 10px; border-radius:4px;">${isReal ? 'Go Virtual' : 'Go Real'}</a>
+                ${user ? `<a href="/profile">Profile</a><a href="/logout">Logout</a>` : `<a href="/login">Login</a>`}
+            </div>
+        </header>
+        ${content}
+        ${getTrackingScript()}
+    </body>
+    </html>`;
+}
+
+// ==========================================
+// 7. ROUTING
+// ==========================================
+app.get('/', async (req, res) => {
+    if(!req.session.userId) return res.redirect('/login');
+    
+    // DIRECT DB CALL
+    let userDoc;
+    try {
+        userDoc = await UserModel.findOne({ id: req.session.userId });
+    } catch(e) { return res.send(`<h1>Database Error: ${e.message}</h1>`); }
+
+    if (!userDoc) { req.session.destroy(); return res.redirect('/login'); }
+    const user = userDoc.toObject();
+    
+    const userCurr = user.currency || 'USD';
+    const rate = CURRENCIES[userCurr].rate;
+    const sym = CURRENCIES[userCurr].symbol;
+    const isReal = user.mode === 'real';
+
+    if(!user.bot.aiStats) user.bot.aiStats = { accuracy: 50, mode: 'Learning', bias: 'Neutral' };
+    const aiStats = user.bot.aiStats;
+    
+    // ⚡ FIX: Fallback to 50 if 0 or undefined ⚡
+    const rawAcc = parseFloat(aiStats.accuracy);
+    const safeAcc = isNaN(rawAcc) || rawAcc <= 0 ? 50.0 : rawAcc;
+    const accColor = safeAcc > 50 ? 'var(--green)' : 'var(--text-secondary)';
+
+    // --- AI LEARNING STATUS LOGIC ---
+    const totalTrades = user.bot.learningMemory ? user.bot.learningMemory.total : 0;
+    const learningTarget = 50; 
+    const learningPct = Math.min((totalTrades / learningTarget) * 100, 100).toFixed(0);
+    const isLearning = totalTrades < learningTarget;
+    const remaining = Math.max(0, learningTarget - totalTrades);
+
+    // 👻 GHOST STATS 👻
+    const ghostMem = user.bot.ghostMemory || { wins: 0, total: 0 };
+    const ghostAcc = ghostMem.total > 0 ? ((ghostMem.wins / ghostMem.total) * 100).toFixed(1) : "0.0";
+    const ghostCount = ghostMem.total;
+
+    let selectedPair = SUPPORTED_PAIRS[0];
+    if (req.query.symbol) {
+        const q = req.query.symbol.trim();
+        const clean = q.toUpperCase().replace(/[^A-Z0-9]/g, '');
+        const found = SUPPORTED_PAIRS.find(p => p.split(':')[0].replace('/', '') === clean);
+        if (found) selectedPair = found;
+    }
+    
+    const rawSymbol = selectedPair.split(':')[0].replace('/', '');
+    const tvSymbol = `HITBTC:${rawSymbol}`; 
+    const cleanPair = rawSymbol;
+    const quote = 'USDT';
+
+    let tradableListHTML = '<div style="color:#999;font-size:0.8rem;">Loading...</div>';
+    
+    try {
+        // ⚡ INSTANTIATE FRESH CLIENT
+        const client = getUserClient(user);
+        const [balanceData, tickers] = await Promise.all([
+            client.fetchBalance(),
+            client.fetchTickers(SUPPORTED_PAIRS)
+        ]);
+        const usdtBal = balanceData.USDT ? parseFloat(balanceData.USDT.free) : 0;
+        const dispBal = usdtBal * rate;
+        const LEV = user.bot.leverage || 10;
+        
+        const coinAnalysis = SUPPORTED_PAIRS.map(s => {
+            const ticker = tickers[s] || {};
+            const market = client.market(s);
+            const minAmount = (market.limits && market.limits.amount && market.limits.amount.min) ? market.limits.amount.min : 0.001;
+            const safePrice = ticker.last || 0;
+            const cost = (safePrice * minAmount) / LEV; 
+            return { symbol: s, display: s.replace('/USDT:USDT',''), cost: cost, price: safePrice };
+        });
+        const affordable = coinAnalysis.filter(c => c.cost <= usdtBal && c.price > 0);
+        if(affordable.length > 0) {
+            tradableListHTML = `
+                <div style="margin-bottom:12px; border-bottom:1px dashed #eee; padding-bottom:8px;">
+                    <div style="font-size:0.75rem; color:var(--text-secondary); margin-bottom:8px; font-weight:500;">Add to Bot (Bud: ${sym}${dispBal.toFixed(4)}):</div>
+                    <div style="display:flex; flex-wrap:wrap;">
+                    ${affordable.map(c => `<span class="chip chip-action" onclick="addCoin('${c.symbol}')">+ ${c.display}</span>`).join(' ')}
+                    </div>
+                </div>`;
+        }
+    } catch(e) { tradableListHTML = `<div style="color:var(--red);font-size:0.8rem;">Error: ${e.message}</div>`; }
+
+    let realKeysForm = '';
+    if(user.mode === 'real') {
+        realKeysForm = `
+        <div class="card" style="border-left: 4px solid var(--red);">
+            <h3>API Configuration</h3>
+            <form action="/api/save-keys" method="POST">
+                <div class="input-group"><label>API Key</label><input type="text" name="apiKey" value="${user.realKeys.apiKey || ''}"></div>
+                <div class="input-group"><label>API Secret</label><input type="password" name="secret" value="${user.realKeys.secret || ''}"></div>
+                <button class="btn btn-sell">Save Keys</button>
+            </form>
+        </div>`;
+    }
+
+    res.send(renderLayout('Dashboard', `
+        <div class="container">
+            <div class="card ticker-bar">
+                <form action="/" method="GET" style="margin:0;">
+                    <div class="input-group" style="margin:0; width:140px; background:transparent;">
+                        <label>Select Pair</label>
+                        <select name="symbol" onchange="this.form.submit()">
+                            ${SUPPORTED_PAIRS.map(p => {
+                                const c = p.split(':')[0].replace('/', '');
+                                return `<option value="${c}" ${p === selectedPair ? 'selected' : ''}>${p.replace(':USDT','')}</option>`;
+                            }).join('')}
+                        </select>
+                    </div>
+                </form>
+                <div>
+                    <span class="data-label">Last Price</span>
+                    <span id="price" class="data-val-lg" style="margin-left:10px; color:var(--green)">---</span>
+                </div>
+                <div style="margin-left:20px; display:flex; gap:15px; border-left:1px solid #ccc; padding-left:15px;">
+                    <div>
+                        <span class="data-label">Sum ROI</span>
+                        <span id="top-roi" style="font-weight:700; color:var(--text);">0.00%</span>
+                    </div>
+                    <div>
+                        <span class="data-label">Sum PnL</span>
+                        <span id="top-pnl" style="font-weight:700; color:var(--text);">0.00</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card order-book">
+                <div class="ob-header"><span>Price (${quote})</span><span>Size</span></div>
+                <div id="asks" style="flex:1; overflow-y:auto; overflow-x:hidden; display:flex; flex-direction:column-reverse;"></div>
+                <div id="midPrice" class="spread-bar">---</div>
+                <div id="bids" style="flex:1; overflow-y:auto; overflow-x:hidden;"></div>
+            </div>
+
+            <div class="card chart-area">
+                <div class="tradingview-widget-container">
+                  <div id="tradingview_b1e3e" style="height:100%;width:100%"></div>
+                  <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+                  <script type="text/javascript">
+                  new TradingView.widget({
+                    "autosize": true, "symbol": "${tvSymbol}", "interval": "15", "timezone": "Etc/UTC", "theme": "light", "style": "1", "locale": "en", "enable_publishing": false, "allow_symbol_change": false, "container_id": "tradingview_b1e3e", "hide_side_toolbar": false
+                  });
+                  </script>
+                </div>
+                
+                <div class="heikin-ashi-container">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <h4 style="margin:0; font-size:0.8rem; color:#666;">HEIKIN ASHI TREND</h4>
+                        <div class="chart-controls">
+                            <div class="chart-btn" onclick="loadHeikinAshi('1m')">1m</div>
+                            <div class="chart-btn active" onclick="loadHeikinAshi('5m')">5m</div>
+                            <div class="chart-btn" onclick="loadHeikinAshi('15m')">15m</div>
+                            <div class="chart-btn" onclick="loadHeikinAshi('30m')">30m</div>
+                            <div class="chart-btn" onclick="loadHeikinAshi('1h')">1h</div>
+                        </div>
+                    </div>
+                    <div style="flex:1; position:relative;">
+                        <canvas id="haChart"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card orders-panel">
+                <div class="order-tabs">
+                    <div id="tab-active" class="order-tab-item active" onclick="switchOrderTab('active')">Active</div>
+                    <div id="tab-filled" class="order-tab-item" onclick="switchOrderTab('filled')">History</div>
+                    <div id="tab-positions" class="order-tab-item" onclick="switchOrderTab('positions')">Positions</div>
+                    <div id="tab-closed" class="order-tab-item" onclick="switchOrderTab('closed')">Closed</div>
+                    <div style="margin-left:auto; padding:12px; cursor:pointer;" onclick="refreshCurrentTab()">↻</div>
+                </div>
+                <div style="flex:1; overflow-y:auto;" id="view-active"><table id="ordersTable"><thead><tr><th>Side</th><th>Price</th><th>Size</th><th>Action</th></tr></thead><tbody id="ordersBody"></tbody></table></div>
+                <div style="flex:1; overflow-y:auto; display:none;" id="view-filled"><table id="filledTable"><thead><tr><th>Time</th><th>Side</th><th>Price</th><th>Size</th><th>Cost</th></tr></thead><tbody id="filledBody"></tbody></table></div>
+                <div style="flex:1; overflow-y:auto; display:none;" id="view-positions"><table id="positionsTable"><thead><tr><th>Symbol</th><th>Side</th><th>Lev</th><th>Size</th><th>Liq.Price</th><th>PnL (${sym})</th><th>ROI</th><th>Action</th></tr></thead><tbody id="positionsBody"></tbody></table></div>
+                <div style="flex:1; overflow-y:auto; display:none;" id="view-closed"><table id="closedTable"><thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Price</th><th>PnL</th><th>ROI</th><th>Vol (1m)</th></tr></thead><tbody id="closedBody"></tbody></table></div>
+            </div>
+
+            <div class="sidebar">
+                ${realKeysForm}
+                
+                <div class="card" style="border-top: 4px solid #ff9800;">
+                    <h3 style="margin-bottom:10px;">🔮 DCA & Profit Projections</h3>
+                    <div style="font-size:0.7rem; color:#666; margin-bottom:10px;">Based on 24h Volatility & Settings</div>
+                    <div id="projection-area">
+                        <div style="padding:10px; text-align:center; color:#999;">Start Bot to see Projections</div>
+                    </div>
+                </div>
+
+                <div class="card" style="border-top: 4px solid var(--primary);">
+                    <h3 style="margin-bottom:10px;">🧠 AI Neural Engine</h3>
+                    <div class="stat-row">
+                        <span class="data-label">Predicted Profitable Accuracy</span>
+                        <span style="font-weight:700; color:${accColor}; font-size:1.1rem;">${safeAcc.toFixed(1)}%</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="data-label">Current Bias</span>
+                        <span style="font-weight:700; color:${aiStats.bias==='Bullish'?'var(--green)':'var(--red)'}">${aiStats.bias.toUpperCase()}</span>
+                    </div>
+                    
+                    <div style="margin-top:10px; padding:10px; background:#f0f8ff; border-radius:6px; border:1px solid #d0e8ff;">
+                        <div style="font-size:0.7rem; font-weight:bold; color:#0055aa; margin-bottom:4px; text-transform:uppercase;">👻 Ghost Simulation (Background)</div>
+                        <div class="stat-row" style="padding:4px 0;">
+                            <span class="data-label">Simulated Accuracy</span>
+                            <span style="font-weight:700; color:${parseFloat(ghostAcc)>50?'var(--green)':'var(--red)'}">${ghostAcc}%</span>
+                        </div>
+                        <div class="stat-row" style="padding:4px 0;">
+                            <span class="data-label">Ghost Trades</span>
+                            <span style="font-weight:700;">${ghostCount}</span>
+                        </div>
+                        <div style="font-size:0.65rem; color:#666; margin-top:4px;">
+                            The AI is paper-trading ${SUPPORTED_PAIRS.length} pairs in the background to accelerate learning.
+                        </div>
+                    </div>
+
+                    <div class="stat-row" style="margin-top:10px; border-top:1px solid #eee; padding-top:10px;">
+                        <span class="data-label">Learning Status</span>
+                        <span class="chip" style="background:${isLearning?'#fff3e0':'#e8f5e9'}; color:${isLearning?'#ef6c00':'#2e7d32'}">${isLearning ? 'LEARNING' : 'MATURE'}</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="data-label">Training Progress</span>
+                        <div style="text-align:right;">
+                            <span style="font-weight:700;">${learningPct}%</span>
+                            <div style="font-size:0.65rem; color:#999;">${remaining} trades to full maturity</div>
+                        </div>
+                    </div>
+                    <div style="width:100%; background:#eee; height:4px; border-radius:2px; margin-top:4px; overflow:hidden;">
+                        <div style="width:${learningPct}%; background:var(--primary); height:100%;"></div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h3>Account Overview</h3>
+                    <div class="stat-row">
+                        <span class="data-label">Equity ${user.mode === 'virtual' ? '<span onclick="setBalance()" style="cursor:pointer;font-size:14px;color:var(--primary);">✎</span>' : ''}</span>
+                        <span id="balance" style="font-weight:700; color:var(--text);">...</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="data-label">Free Margin</span>
+                        <span id="marginFree">0.00</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="data-label">Margin Used</span>
+                        <span id="marginUsed">0.00</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="data-label">Unrealized PnL</span>
+                        <span id="upnl">0.00</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="data-label">Realized PnL <sup onclick="resetPnl()" style="cursor:pointer;color:var(--red)">[x]</sup></span>
+                        <span id="closedPnl">0.00</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="data-label">Max Margin <sup onclick="resetMaxMargin()" style="cursor:pointer;color:var(--red)">[x]</sup></span>
+                        <span id="maxMargin">0.00</span>
+                    </div>
+                    <div style="background:#f5f5f5; border-radius:4px; padding:8px 12px; margin-top:12px;">
+                        <span class="data-label" style="display:block; margin-bottom:4px;">Est. Yield (${sym})</span>
+                        <div style="display:flex; justify-content:space-between;">
+                            <small>Hourly: <span id="estHour" class="text-green">0.00</span></small>
+                            <small>Yearly: <span id="estYear" class="text-green">0.00</span></small>
+                        </div>
+                    </div>
+                    <div style="display:flex; gap:8px; margin-top:16px;">
+                        <button class="btn btn-primary" onclick="closeCurrentPosition()" style="background:#455a64;">Close Pos</button>
+                        <button class="btn btn-sell" onclick="closeAllPositions()">Close All</button>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+                        <h3 style="margin:0;">Bot Engine</h3>
+                        <span id="bot-status-chip" class="chip" style="${user.bot.active ? 'background:#e6f4ea; color:#1e8e3e;' : 'background:#fce8e6; color:#c62828;'} font-weight:bold;">${user.bot.active ? 'RUNNING' : 'STOPPED'}</span>
+                    </div>
+                    <div id="bot-active-list" style="max-height:200px; overflow-y:auto; border:1px solid #f0f0f0; border-radius:4px; padding:0 8px; margin-bottom:12px;">
+                        <div style="padding:10px; text-align:center; font-size:0.8rem; color:#999;">Loading...</div>
+                    </div>
+                    ${tradableListHTML}
+                    <div style="text-align:right; margin-bottom:12px;">
+                        <span class="btn-text" onclick="addAllCoins()" style="cursor:pointer; font-size:0.75rem;">+ ADD ALL</span>
+                        <span class="btn-text" onclick="clearCoins()" style="cursor:pointer; font-size:0.75rem; color:var(--red);">CLEAR</span>
+                    </div>
+                    <form onsubmit="updateBotSettings(event)">
+                        <input type="hidden" name="symbol" value="${cleanPair}">
+                        
+                        <div class="input-group" style="margin-bottom:12px;">
+                            <label>Strategy</label>
+                            <select name="strategy">
+                                <option value="neural" ${user.bot.strategy === 'neural' ? 'selected' : ''}>Neural Hybrid (Default)</option>
+                                <option value="ha_1m" ${user.bot.strategy === 'ha_1m' ? 'selected' : ''}>1m HA Follower</option>
+                                <option value="ha_5m" ${user.bot.strategy === 'ha_5m' ? 'selected' : ''}>5m HA Follower</option>
+                                <option value="ha_15m" ${user.bot.strategy === 'ha_15m' ? 'selected' : ''}>15m HA Follower</option>
+                                <option value="ha_30m" ${user.bot.strategy === 'ha_30m' ? 'selected' : ''}>30m HA Follower</option>
+                                <option value="ha_1h" ${user.bot.strategy === 'ha_1h' ? 'selected' : ''}>1H HA Follower</option>
+                                <option value="fast_profit" ${user.bot.strategy === 'fast_profit' ? 'selected' : ''}>Fast Profit (SMA+ATR)</option>
+                            </select>
+                        </div>
+
+                        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:12px;">
+                            <div class="input-group"><label>Leverage</label><input type="number" name="leverage" value="${user.bot.leverage}"></div>
+                            <div class="input-group"><label>Multiplier</label><input type="number" name="tradeMultiplier" value="${user.bot.tradeMultiplier || 1}" step="0.5"></div>
+                            <div class="input-group"><label>DCA Trigger %</label><input type="number" name="triggerRoi" value="${user.bot.triggerRoi || 9999}"></div>
+                            <div class="input-group"><label>DCA Target %</label><input type="number" name="recoveryRoi" value="${user.bot.recoveryRoi || 9999}"></div>
+                            <div class="input-group" style="grid-column:1/-1;"><label>Gradual DCA %</label><input type="number" name="gradualDcaRoi" value="${user.bot.gradualDcaRoi || 9999}" placeholder="9999"></div>
+                            <div class="input-group"><label>Take Profit %</label><input type="number" name="profitRoi" value="${user.bot.profitRoi || 2}"></div>
+                            <div class="input-group"><label>Stop Loss %</label><input type="number" name="stopLossRoi" value="${user.bot.stopLossRoi || -10}"></div>
+                        </div>
+                        <button class="btn btn-primary" style="margin-top:10px;">SAVE SETTINGS</button>
+                    </form>
+                    <button id="btn-toggle-engine" onclick="toggleBotEngine()" class="btn" style="background:${user.bot.active ? 'var(--red)' : 'var(--green)'}; margin-top:10px;">${user.bot.active ? 'STOP ENGINE' : 'START ENGINE'}</button>
+                </div>
+
+                <div class="card">
+                    <h3>Manual Trade</h3>
+                    <div class="tabs">
+                        <div class="tab active" id="tabLimit" onclick="switchTab('limit')">Limit</div>
+                        <div class="tab" id="tabMarket" onclick="switchTab('market')">Market</div>
+                    </div>
+                    <div id="priceGroup" class="input-group">
+                        <label>Price (${quote})</label>
+                        <input type="number" id="tradePrice" step="0.1" placeholder="0.00">
+                    </div>
+                    <div style="display:grid; grid-template-columns: 2fr 1fr; gap:12px;">
+                        <div class="input-group">
+                            <label>Amount</label>
+                            <input type="number" id="tradeAmount" step="1" placeholder="Qty">
+                        </div>
+                        <div class="input-group">
+                            <label>Lev (x)</label>
+                            <input type="number" id="manualLev" value="10" min="1" max="100">
+                        </div>
+                    </div>
+                    <div style="display:flex; gap:10px; margin-top:8px;">
+                        <button class="btn btn-buy" onclick="placeOrder('buy')">Long</button>
+                        <button class="btn btn-sell" onclick="placeOrder('sell')">Short</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <script src="/socket.io/socket.io.js"></script>
+        <script>
+            const socket = io();
+            const symbol = "${selectedPair}";
+            let orderType = 'limit';
+            let haChart = null;
+
+            // REAL-TIME DATA POLLING
+            function fetchRealTimeData() {
+                // ⚡⚡ AUTO REFRESH TABLE INCLUDED ⚡⚡
+                refreshCurrentTab();
+
+                fetch('/api/realtime-data?symbol=' + symbol)
+                .then(r => r.json())
+                .then(d => {
+                    // Update Bot List
+                    const botListEl = document.getElementById('bot-active-list');
+                    if (d.coins.length > 0) {
+                        botListEl.innerHTML = d.coins.map(c => \`
+                            <div class="stat-row" id="coin-\${c.symbol.replace(/[^a-zA-Z]/g, '')}">
+                                <div style="flex:1;">
+                                    <div style="display:flex; align-items:center; margin-bottom:2px;">
+                                        <span style="font-weight:500; font-size:0.9rem;">\${c.display}</span>
+                                        \${c.hasPos ? \`<span class="chip" style="margin-left:8px; height:18px; font-size:0.65rem; background:\${c.side==='long'?'#e6f4ea':'#fce8e6'}; color:\${c.side==='long'?'var(--green)':'var(--red)'}">\${c.side.toUpperCase()}</span>\` : ''}
+                                    </div>
+                                    <div style="font-size:0.75rem; color:var(--text-secondary);">
+                                        ROI: <span style="color:\${c.roiColor}; font-weight:bold;">\${c.roi}</span> | Est. Rec. Qty: <strong>\${c.recQty}</strong>
+                                    </div>
+                                    \${c.exhaustion ? \`<div style="font-size:0.7rem; color:#d32f2f; margin-top:2px; font-weight:bold;">\${c.exhaustion}</div>\` : ''}
+                                </div>
+                                <div style="display:flex; gap:8px;">
+                                    <button onclick="triggerDCA('\${c.symbol}')" class="btn" style="width:auto; padding:4px 8px; font-size:0.7rem; background:#ff9800; color:white;" title="DCA NOW">⚡</button>
+                                    <button onclick="removeCoin('\${c.symbol}')" style="background:none; border:none; color:#ccc; cursor:pointer; font-weight:bold; font-size:1.1rem;">&times;</button>
+                                </div>
+                            </div>
+                        \`).join('');
+                    } else {
+                        botListEl.innerHTML = '<div style="padding:10px; text-align:center; font-size:0.8rem; color:#999;">No active pairs</div>';
+                    }
+
+                    // Update Bot Status Chip & Button
+                    const statusChip = document.getElementById('bot-status-chip');
+                    const toggleBtn = document.getElementById('btn-toggle-engine');
+                    if(d.botActive) {
+                        statusChip.innerHTML = 'RUNNING';
+                        statusChip.style.background = '#e6f4ea'; statusChip.style.color = '#1e8e3e';
+                        toggleBtn.innerHTML = 'STOP ENGINE';
+                        toggleBtn.style.background = 'var(--red)';
+                    } else {
+                        statusChip.innerHTML = 'STOPPED';
+                        statusChip.style.background = '#fce8e6'; statusChip.style.color = '#c62828';
+                        toggleBtn.innerHTML = 'START ENGINE';
+                        toggleBtn.style.background = 'var(--green)';
+                    }
+
+                    // Update Account Stats
+                    document.getElementById('upnl').innerText = d.account.upnl; 
+                    document.getElementById('upnl').className = 'data-val-lg ' + (parseFloat(d.account.upnl)>=0?'text-green':'text-red');
+                    document.getElementById('closedPnl').innerText = d.account.closedPnl;
+                    document.getElementById('maxMargin').innerText = d.account.maxMargin;
+                    document.getElementById('balance').innerText = d.account.balance;
+                    document.getElementById('marginFree').innerText = d.account.marginFree;
+                    document.getElementById('marginUsed').innerText = d.account.marginUsed;
+                    document.getElementById('estHour').innerText = d.account.estHour || '0.00';
+                    document.getElementById('estYear').innerText = d.account.estYear || '0.00';
+                    
+                    // NEW TOP BAR STATS
+                    const sumRoi = parseFloat(d.account.sumRoi || 0);
+                    const sumPnl = parseFloat(d.account.sumPnl || 0);
+                    
+                    const roiEl = document.getElementById('top-roi');
+                    roiEl.innerText = sumRoi.toFixed(2) + '%';
+                    roiEl.style.color = sumRoi >= 0 ? 'var(--green)' : 'var(--red)';
+                    
+                    const pnlEl = document.getElementById('top-pnl');
+                    pnlEl.innerText = sumPnl.toFixed(2);
+                    pnlEl.style.color = sumPnl >= 0 ? 'var(--green)' : 'var(--red)';
+                });
+            }
+
+            // Poll every 1 second
+            setInterval(fetchRealTimeData, 1000);
+            fetchRealTimeData(); // Initial call
+
+            // ⚡ HEIKIN ASHI CHART LOGIC (LOCAL CALCULATION) ⚡
+            function loadHeikinAshi(timeframe) {
+                // Update active button state
+                document.querySelectorAll('.chart-btn').forEach(b => {
+                    b.classList.remove('active');
+                    if(b.innerText.toLowerCase() === timeframe.toLowerCase()) b.classList.add('active');
+                });
+
+                fetch('/api/candles?symbol=' + symbol + '&timeframe=' + timeframe)
+                .then(r => r.json())
+                .then(candles => {
+                    if (!candles || candles.length === 0) return;
+
+                    // Calculate Heikin Ashi Locally
+                    let haData = [];
+                    let prevHA = null;
+
+                    candles.forEach((c, index) => {
+                        // c = [time, open, high, low, close]
+                        const time = c[0];
+                        const o = c[1];
+                        const h = c[2];
+                        const l = c[3];
+                        const cl = c[4];
+
+                        let haClose = (o + h + l + cl) / 4;
+                        let haOpen = (index === 0) ? (o + cl) / 2 : (prevHA.open + prevHA.close) / 2;
+                        let haHigh = Math.max(h, haOpen, haClose);
+                        let haLow = Math.min(l, haOpen, haClose);
+
+                        haData.push({ x: time, o: haOpen, c: haClose, h: haHigh, l: haLow });
+                        prevHA = { open: haOpen, close: haClose };
+                    });
+
+                    drawHeikinAshiChart(haData);
+                });
+            }
+
+            function drawHeikinAshiChart(data) {
+                const ctx = document.getElementById('haChart').getContext('2d');
+                
+                // Prepare Data for Floating Bar Chart (Body)
+                // Chart.js Bar Chart: data = [min, max]
+                const barData = data.map(d => ({
+                    x: d.x,
+                    y: [d.o, d.c], // Floating bar from Open to Close
+                    // Store color info for scriptable options
+                    color: d.c >= d.o ? '#00e676' : '#ef5350' 
+                }));
+
+                if (haChart) haChart.destroy();
+
+                haChart = new Chart(ctx, {
+                    type: 'bar',
+                    data: {
+                        datasets: [{
+                            label: 'Heikin Ashi Body',
+                            data: barData,
+                            backgroundColor: (ctx) => {
+                                const val = ctx.raw;
+                                if(!val) return '#00e676';
+                                return val[1] >= val[0] ? '#00e676' : '#ef5350';
+                            },
+                            borderWidth: 0,
+                            barPercentage: 0.9,
+                            categoryPercentage: 0.9
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        animation: false,
+                        scales: {
+                            x: {
+                                type: 'time',
+                                time: { unit: 'minute', displayFormats: { minute: 'HH:mm' } },
+                                grid: { display: false }
+                            },
+                            y: {
+                                position: 'right',
+                                grid: { color: '#f0f0f0' },
+                                beginAtZero: false, // ⚡ FIXED: Prevents squashed chart
+                                grace: '10%'
+                            }
+                        },
+                        plugins: {
+                            legend: { display: false },
+                            tooltip: {
+                                callbacks: {
+                                    label: function(context) {
+                                        const raw = context.raw;
+                                        const open = raw[0];
+                                        const close = raw[1];
+                                        return \`O: \${open.toFixed(4)}  C: \${close.toFixed(4)}\`;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+
+            // Initial Load
+            loadHeikinAshi('5m');
+
+            socket.on('market_' + symbol, data => {
+                document.getElementById('price').innerText = data.price.toFixed(2);
+                document.getElementById('midPrice').innerText = data.price.toFixed(2);
+                const row = (p, a, c) => \`<div class="ob-row" onclick="fillPrice(\${p})"><span class="\${c}" style="font-weight:700;">\${p.toFixed(2)}</span><span>\${a}</span></div>\`;
+                document.getElementById('asks').innerHTML = data.asks.map(x => row(x[0], x[1], 'text-red')).join('');
+                document.getElementById('bids').innerHTML = data.bids.map(x => row(x[0], x[1], 'text-green')).join('');
+            });
+            function switchTab(type) {
+                orderType = type;
+                document.getElementById('tabLimit').className = (type === 'limit' ? 'tab active' : 'tab');
+                document.getElementById('tabMarket').className = (type === 'market' ? 'tab active' : 'tab');
+                document.getElementById('priceGroup').style.display = (type === 'limit' ? 'block' : 'none');
+            }
+            function fillPrice(p) { if(orderType === 'limit') document.getElementById('tradePrice').value = p; }
+            function placeOrder(side) {
+                const amount = document.getElementById('tradeAmount').value;
+                const price = document.getElementById('tradePrice').value;
+                const leverage = document.getElementById('manualLev').value;
+                fetch('/api/trade', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ symbol, side, type: orderType, amount, price, leverage })
+                }).then(r => r.json()).then(d => { 
+                    if(d.success) { showToast('Order Placed'); refreshCurrentTab(); }
+                    else showToast('Error: ' + d.error, true); 
+                });
+            }
+            function closeCurrentPosition() { if(confirm('Close '+symbol+'?')) fetch('/api/close', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ symbol }) }).then(() => { showToast('Position Closed'); refreshCurrentTab(); }); }
+            function closeAllPositions() { if(confirm('CLOSE ALL POSITIONS?')) fetch('/api/close-all', { method: 'POST' }).then(() => { showToast('All Positions Closed'); refreshCurrentTab(); }); }
+            function fetchOrders() { fetch('/api/orders?symbol='+symbol).then(r=>r.json()).then(d => document.getElementById('ordersBody').innerHTML = d.map(o => \`<tr><td>\${o.side=='buy'?'text-green':'text-red'}</td><td>\${o.price}</td><td>\${o.amount}</td><td>\${o.cost.toFixed(2)}</td></tr>\`).join('')); }
+            function fetchHistory() { fetch('/api/history?symbol='+symbol).then(r=>r.json()).then(d => document.getElementById('filledBody').innerHTML = d.map(o => \`<tr><td>\${new Date(o.timestamp).toLocaleTimeString()}</td><td>\${o.side=='buy'?'text-green':'text-red'}</td><td>\${o.price}</td><td>\${o.amount}</td><td>\${o.cost.toFixed(2)}</td></tr>\`).join('')); }
+            function fetchPositions() { fetch('/api/raw-positions').then(r=>r.json()).then(d => document.getElementById('positionsBody').innerHTML = d.map(o => \`<tr><td>\${o.symbol.replace(':USDT','')}</td><td class="\${o.side=='long'?'text-green':'text-red'}">\${o.side.toUpperCase()}</td><td>\${o.leverage}x</td><td>\${o.size}</td><td>\${parseFloat(o.liquidationPrice).toFixed(2)}</td><td class="\${parseFloat(o.pnl)>=0?'text-green':'text-red'}">\${o.pnl}</td><td>\${parseFloat(o.roi).toFixed(2)}%</td><td><button class="btn btn-sell" style="padding:4px 8px; font-size:10px; width:auto;" onclick="closeSpecific('\${o.symbol}')">CLOSE</button></td></tr>\`).join('')); }
+            function fetchClosed() { fetch('/api/closed-positions?symbol='+symbol).then(r=>r.json()).then(d => document.getElementById('closedBody').innerHTML = d.map(o => \`<tr><td>\${new Date(o.timestamp).toLocaleTimeString()}</td><td>\${o.symbol}</td><td class="\${o.side=='long'?'text-green':'text-red'}">\${o.side.toUpperCase()}</td><td>\${o.close}</td><td class="\${parseFloat(o.pnl)>=0?'text-green':'text-red'}">\${o.pnl}</td><td>\${o.roi}%</td><td>\${o.volatility}%</td></tr>\`).join('')); }
+            function cancelOrder(id) { fetch('/api/cancel', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ id, symbol }) }).then(() => { showToast('Order Cancelled'); fetchOrders(); }); }
+            
+            refreshCurrentTab();
+        </script>
+    `, user));
+});
+
+// ==========================================
+// 8. AUTHENTICATION ROUTES (LOGIN/REGISTER)
+// ==========================================
+// ⚡ FIX: MOVED ROUTES HERE TO ENSURE PRIORITY AND VISIBILITY
+app.get('/login', (req, res) => res.send(renderLayout('Login', `<div class="auth-container"><div class="card auth-card"><h3>Login</h3><form action="/login" method="POST"><div class="input-group"><label>Username</label><input type="text" name="username"></div><div class="input-group"><label>Password</label><input type="password" name="password"></div><button class="btn btn-primary" style="margin-top:10px;">Login</button></form><a href="/register" style="font-size:0.8rem; display:block; margin-top:15px; color:#5f6368; text-decoration:none;">Create Account</a></div></div>`, null)));
+
+app.post('/login', async (req, res) => { 
+    const u = await UserModel.findOne({ username: req.body.username, password: req.body.password }); 
+    if(u) { req.session.userId = u.id; res.redirect('/'); } 
+    else res.redirect('/login'); 
+});
+
+app.get('/register', (req, res) => res.send(renderLayout('Register', `<div class="auth-container"><div class="card auth-card"><h3>Register</h3><form action="/register" method="POST"><div class="input-group"><label>Username</label><input type="text" name="username"></div><div class="input-group"><label>Password</label><input type="password" name="password"></div><button class="btn btn-primary" style="margin-top:10px;">Sign Up</button></form></div></div>`, null)));
+
+app.post('/register', async (req, res) => { 
+    const newUser = { id: crypto.randomBytes(8).toString('hex'), username: req.body.username, password: req.body.password, currency: 'USD', mode: 'virtual', realKeys: { apiKey: '', secret: '' }, bot: { active: false, coins: [], leverage: 100, tradeType: 'usdt', tradeAmount: 10, tradeMultiplier: 1, triggerRoi: 9999, recoveryRoi: 9999, profitRoi: 2, stopLossRoi: -10, gradualDcaRoi: 9999, aiStats: { accuracy: 50, mode: 'Learning', bias: 'Neutral' }, learningMemory: { wins: 0, total: 0 }, ghostMemory: { wins: 0, total: 0, activeSims: [] } }, virtual: { balance: STARTING_BALANCE, positions: {}, orders: [], trades: [], closedTrades: [], maxMarginUsed: 0 }, real: { closedTrades: [] }, client: null }; 
+    await UserModel.create(newUser); analytics.registrations++; saveAnalytics(); req.session.userId = newUser.id; res.redirect('/'); 
+});
+
+app.get('/logout', (req, res) => { req.session.destroy(); res.redirect('/login'); });
+
+// [NEWS ROUTES] - Handles main news list and individual article view
+app.get('/news', (req, res) => {
+    getNewsData((articles) => {
+        const content = `<div class="container" style="display:block; max-width:800px; margin:20px auto;">
+            <div class="card"><h3>Crypto News</h3>
+            ${articles.map(a => `
+                <div style="border-bottom:1px solid #eee; padding:15px 0;">
+                    <a href="/news/view/${slugify(a.title)}" style="font-weight:bold; font-size:1.1rem; text-decoration:none; color:var(--primary); display:block; margin-bottom:5px;">${a.title}</a>
+                    <div style="font-size:0.85rem; color:#666;">${a.description || ''}</div>
+                    <div style="font-size:0.75rem; color:#999; margin-top:5px;">${new Date(a.publishedAt).toLocaleString()}</div>
+                </div>
+            `).join('')}
+            </div></div>`;
+        res.send(renderLayout('News', content, { mode: 'virtual' }));
+    });
+});
+
+app.get('/news/view/:slug', (req, res) => {
+     getNewsData((articles) => {
+        const article = articles.find(a => slugify(a.title) === req.params.slug);
+        if(!article) return res.redirect('/news');
+        const content = `<div class="container" style="display:block; max-width:800px; margin:20px auto;">
+            <div class="card">
+                <h3>${article.title}</h3>
+                ${article.urlToImage ? `<img src="${article.urlToImage}" style="width:100%; border-radius:8px; margin-bottom:15px;">` : ''}
+                <p style="line-height:1.6;">${article.content || article.description}</p>
+                <a href="${article.url}" target="_blank" class="btn btn-primary" style="display:inline-block; width:auto; text-decoration:none;">Read Full Source</a>
+            </div>
+        </div>`;
+        res.send(renderLayout(article.title, content, { mode: 'virtual' }));
+     });
+});
+
+// [PROFILE ROUTE] - Handles currency selection logic
+app.get('/profile', async (req, res) => {
+    if(!req.session.userId) return res.redirect('/login');
+    const user = await UserModel.findOne({ id: req.session.userId });
+    res.send(renderLayout('Profile', `
+        <div class="container" style="display:block; max-width:600px; margin:20px auto;">
+            <div class="card">
+                <h3>User Profile</h3>
+                <form action="/profile" method="POST">
+                    <div class="input-group">
+                        <label>Username</label>
+                        <input type="text" value="${user.username}" disabled style="opacity:0.6">
+                    </div>
+                    <div class="input-group">
+                        <label>Preferred Currency</label>
+                        <select name="currency">
+                            ${Object.keys(CURRENCIES).map(c => `<option value="${c}" ${user.currency === c ? 'selected' : ''}>${c} (${CURRENCIES[c].symbol})</option>`).join('')}
+                        </select>
+                    </div>
+                    <button class="btn btn-primary">Save Profile</button>
+                </form>
+            </div>
+        </div>
+    `, user));
+});
+
+app.post('/profile', async (req, res) => {
+    if(!req.session.userId) return res.redirect('/login');
+    const user = await UserModel.findOne({ id: req.session.userId });
+    user.currency = req.body.currency;
+    await saveUser(user);
+    res.redirect('/profile');
+});
+
+// ==========================================
+// NEW REAL-TIME DATA ENDPOINT (UPDATED FOR EXHAUSTION)
+// ==========================================
+app.get('/api/realtime-data', async (req, res) => {
+    try {
+        const user = await UserModel.findOne({ id: req.session.userId });
+        if(!user) return res.json({ coins: [], account: {} });
+        
+        const client = getUserClient(user);
+        const allPositions = await client.fetchPositions();
+        const positions = allPositions;
+        const bal = await client.fetchBalance();
+        
+        // Calculate Account Stats
+        const r = CURRENCIES[user.currency||'USD'].rate;
+        const s = CURRENCIES[user.currency||'USD'].symbol;
+        const walletBalance = parseFloat(bal.USDT.total || 0);
+        
+        let closedPnl = 0; let recentPnl = 0; const now = Date.now(); const oneDay = 24 * 60 * 60 * 1000;
+        if (user.mode === 'real') { 
+            if (!user.real) user.real = {}; 
+            if (user.real.startBalance === undefined || user.real.startBalance === null) { user.real.startBalance = walletBalance; saveUser(user); } 
+            closedPnl = walletBalance - user.real.startBalance; 
+            const tradeHistory = user.real.closedTrades || []; 
+            if(tradeHistory.length > 0) recentPnl = tradeHistory.filter(t => (now - t.timestamp) < oneDay).reduce((a, t) => a + (t.pnl || 0), 0); 
+        } else { 
+            let tradeHistory = user.virtual.closedTrades || []; 
+            if(tradeHistory.length > 0) { 
+                closedPnl = tradeHistory.reduce((a,t)=>a+(t.pnl||0),0); 
+                recentPnl = tradeHistory.filter(t => (now - t.timestamp) < oneDay).reduce((a, t) => a + (t.pnl || 0), 0); 
+            } 
+        }
+
+        const estDay = recentPnl; const estHour = estDay / 24; const estYear = estDay * 365;
+        const usedMargin = parseFloat(bal.USDT.used || 0); const freeMargin = parseFloat(bal.USDT.free || 0);
+        const maxMargin = (user.mode === 'real' ? (client.maxMarginUsed || 0) : (user.virtual.maxMarginUsed || 0));
+        
+        // Find current requested symbol specific pnl
+        const currentPos = positions.find(p => p.symbol === req.query.symbol) || {};
+        const currentUpnl = parseFloat(currentPos.unrealizedPnl || 0);
+
+        // ⚡⚡⚡ SUM OF OPEN TRADES ROI & PNL ⚡⚡⚡
+        let sumRoi = 0;
+        let sumPnl = 0;
+        let activeCount = 0;
+        
+        positions.forEach(p => {
+            const size = parseFloat(p.contracts || 0);
+            if (size > 0) {
+                sumPnl += parseFloat(p.unrealizedPnl || 0);
+                sumRoi += parseFloat(p.roi || 0);
+                activeCount++;
+            }
+        });
+
+        // ⚡ HIGH PRECISION (10 DECIMALS) FOR PNL/MARGIN ⚡
+        const accountData = {
+            upnl: (currentUpnl * r).toFixed(10),
+            closedPnl: (closedPnl * r).toFixed(10),
+            roi: (currentPos.roi || 0).toFixed(2) + '%',
+            marginUsed: s + (usedMargin * r).toFixed(10),
+            marginFree: s + (freeMargin * r).toFixed(10),
+            maxMargin: s + (maxMargin * r).toFixed(10),
+            balance: s + (walletBalance * r).toFixed(10),
+            estHour: s + (estHour * r).toFixed(10),
+            estYear: s + (estYear * r).toFixed(10),
+            // NEW TOP BAR DATA
+            sumRoi: sumRoi.toFixed(2),
+            sumPnl: (sumPnl * r).toFixed(10)
+        };
+
+        // Calculate Bot Coin Data - NOW WITH EXHAUSTION LOGIC
+        // We need to use Promise.all to fetch candles for all coins in parallel without blocking too much
+        const coinData = await Promise.all(user.bot.coins.map(async (c) => {
+            const pos = positions.find(p => p.symbol === c.symbol) || {};
+            const size = parseFloat(pos.contracts || 0);
+            let recQtyDisplay = '-';
+            let currentRoiDisplay = '0.00%';
+            let roiColor = 'var(--text-secondary)';
+            let hasPos = false;
+            let side = '';
+            let exhaustionDisplay = null;
+            
+            if(size > 0) {
+                hasPos = true;
+                side = pos.side;
+                const ticker = GLOBAL_TICKERS[c.symbol] || {};
+                const entryPrice = parseFloat(pos.entryPrice);
+                const lev = parseFloat(pos.leverage || user.bot.leverage || 10);
+                
+                // PNL Calc (Uses Mark Price to match Exchange)
+                const pnlCalc = calculatePositionPNL(pos, ticker, user.mode);
+                const currentPrice = pnlCalc.exitPrice;
+                currentRoiDisplay = pnlCalc.roi.toFixed(2) + '%';
+                roiColor = pnlCalc.roi >= 0 ? 'var(--green)' : 'var(--red)';
+                
+                // --- EXHAUSTION LOGIC (Only for Fast Profit Strategy) ---
+                if (user.bot.strategy === 'fast_profit') {
+                    try {
+                        const cleanSym = c.symbol.split(':')[0];
+                        // Fetch last 20 1m candles for SMA/ATR calc
+                        const candles = await publicClient.fetchOHLCV(cleanSym, '1m', undefined, 20);
+                        if (candles && candles.length >= 15) {
+                            const closes = candles.map(k => k[4]);
+                            const sma = calculateSMA(closes, 14);
+                            const atr = calculateATR(candles, 14);
+                            
+                            // Exhaustion Band (2.5x ATR deviation)
+                            const bandDist = 2.5 * atr;
+                            const upperBand = sma + bandDist;
+                            const lowerBand = sma - bandDist;
+                            
+                            // Determine if we are maxed out in specific direction
+                            // UI should show which direction is maxed out
+                            
+                            let distPct = 0;
+                            if (currentPrice > upperBand) {
+                                exhaustionDisplay = "MAXED OUT (LONG)";
+                            } else if (currentPrice < lowerBand) {
+                                exhaustionDisplay = "MAXED OUT (SHORT)";
+                            } else {
+                                // If not maxed out, show distance to appropriate band based on current trend or position
+                                if (side === 'long') {
+                                    distPct = ((upperBand - currentPrice) / currentPrice) * 100;
+                                    exhaustionDisplay = `${distPct.toFixed(2)}% to Max Long`;
+                                } else {
+                                    distPct = ((currentPrice - lowerBand) / currentPrice) * 100;
+                                    exhaustionDisplay = `${distPct.toFixed(2)}% to Max Short`;
+                                }
+                            }
+                        }
+                    } catch(e) { /* Ignore fetch errors for UI update */ }
+                }
+                
+                // DCA Qty Logic
+                const recoveryRoi = parseFloat(user.bot.recoveryRoi || -5);
+                const targetRoiDec = recoveryRoi / 100;
+                let targetAvgPrice = 0;
+                
+                if (pos.side === 'long') targetAvgPrice = currentPrice / (1 + (targetRoiDec / lev)); 
+                else targetAvgPrice = currentPrice / (1 - (targetRoiDec / lev));
+                
+                const priceDiffEntry = Math.abs(entryPrice - targetAvgPrice);
+                const priceDiffCurrent = Math.abs(targetAvgPrice - currentPrice);
+                
+                if (priceDiffCurrent > 0.00000001) {
+                    let qtyNeeded = (size * priceDiffEntry) / priceDiffCurrent;
+                    if (qtyNeeded < 0) qtyNeeded = 0; 
+                    
+                    let market = client.market(c.symbol);
+                    let stepSize = 0.001;
+                    if(market && market.limits && market.limits.amount && market.limits.amount.min) stepSize = market.limits.amount.min;
+                    let finalQty = roundToStep(qtyNeeded, stepSize);
+                    if (finalQty < stepSize) finalQty = stepSize;
+                    
+                    const estimatedValue = finalQty * currentPrice * r;
+                    recQtyDisplay = `${finalQty} <span style="font-size:0.8em; color:#777; font-weight:normal;">(${s}${estimatedValue.toFixed(2)})</span>`;
+                }
+            }
+
+            return {
+                symbol: c.symbol,
+                display: c.symbol.replace('/USDT:USDT',''),
+                roi: currentRoiDisplay,
+                roiColor: roiColor,
+                recQty: recQtyDisplay,
+                hasPos: hasPos,
+                side: side,
+                exhaustion: exhaustionDisplay // New Field
+            };
+        }));
+
+        // ⚡ SORT ALPHABETICALLY TO PREVENT JUMPING ⚡
+        coinData.sort((a, b) => a.symbol.localeCompare(b.symbol));
+
+        res.json({ 
+            success: true, 
+            coins: coinData, 
+            botActive: user.bot.active,
+            account: accountData 
+        });
+
+    } catch(e) {
+        res.json({ success: false, error: e.message });
+    }
+});
+
+// ⚡⚡⚡ NEW ENDPOINT: CANDLE DATA FOR CHART ⚡⚡⚡
+app.get('/api/candles', async (req, res) => {
+    try {
+        const symbol = req.query.symbol;
+        const timeframe = req.query.timeframe || '5m';
+        
+        let candles = [];
+        try {
+            // Try clean symbol first (e.g. BTC/USDT)
+            const cleanSym = symbol.split(':')[0];
+            candles = await publicClient.fetchOHLCV(cleanSym, timeframe, undefined, 50); // Get last 50 candles
+        } catch(err) {
+            try { candles = await publicClient.fetchOHLCV(symbol, timeframe, undefined, 50); } catch(e2) {}
+        }
+        
+        res.json(candles);
+    } catch(e) {
+        res.json([]);
+    }
+});
+
+// ⚡⚡⚡ ADDED MISSING ROUTE FOR REAL KEYS ⚡⚡⚡
+app.post('/api/save-keys', async (req, res) => {
+    if(!req.session.userId) return res.redirect('/login');
+    const user = await UserModel.findOne({ id: req.session.userId });
+    if(user) {
+        user.realKeys = { apiKey: req.body.apiKey, secret: req.body.secret };
+        await saveUser(user);
+    }
+    res.redirect('/');
+});
+
+app.post('/bot/update-settings', async (req, res) => { 
+    const user = await UserModel.findOne({ id: req.session.userId }); 
+    user.bot.leverage = req.body.leverage; 
+    user.bot.triggerRoi = req.body.triggerRoi;
+    user.bot.recoveryRoi = req.body.recoveryRoi;
+    user.bot.tradeMultiplier = req.body.tradeMultiplier;
+    user.bot.profitRoi = req.body.profitRoi; 
+    user.bot.stopLossRoi = req.body.stopLossRoi;
+    user.bot.gradualDcaRoi = req.body.gradualDcaRoi; 
+    user.bot.strategy = req.body.strategy; // ⚡ SAVE STRATEGY
+    // Do NOT toggle active state here
+    await saveUser(user); 
+    res.json({ success: true }); 
+});
+
+app.post('/bot/toggle', async (req, res) => {
+    const user = await UserModel.findOne({ id: req.session.userId });
+    user.bot.active = !user.bot.active;
+    if(user.bot.active) analytics.botStarts++;
+    await saveUser(user);
+    res.json({ success: true, active: user.bot.active });
+});
+
+// ⚡⚡⚡ FIXED API ENDPOINTS FOR LIST MANAGEMENT ⚡⚡⚡
+// We use .toObject() to convert Mongoose Doc to Plain JS Object to fix "Mixed" type change tracking issues.
+
+app.post('/bot/add', async (req, res) => {
+    const doc = await UserModel.findOne({ id: req.session.userId });
+    const user = doc.toObject(); // FIX
+    const symbol = req.body.symbol.trim();
+    if(!user.bot.coins.find(c => c.symbol === symbol)) {
+        user.bot.coins.push({ symbol: symbol, side: (user.bot.coins.length%2===0?'buy':'sell'), lastAction:0, dcaCount:0 });
+        await saveUser(user);
+    }
+    res.json({ success: true });
+});
+
+app.post('/bot/add-all', async (req, res) => {
+    const doc = await UserModel.findOne({ id: req.session.userId });
+    const user = doc.toObject(); // FIX
+    let c = user.bot.coins.length;
+    SUPPORTED_PAIRS.forEach(s => {
+        if(!user.bot.coins.find(x=>x.symbol===s)) {
+            user.bot.coins.push({ symbol:s, side: (c%2===0?'buy':'sell'), lastAction:0, dcaCount:0 });
+            c++;
+        }
+    });
+    await saveUser(user);
+    res.json({ success: true });
+});
+
+app.post('/bot/remove', async (req, res) => {
+    const doc = await UserModel.findOne({ id: req.session.userId });
+    const user = doc.toObject(); // FIX
+    const symbol = req.body.symbol.trim();
+    user.bot.coins = user.bot.coins.filter(c => c.symbol !== symbol);
+    await saveUser(user);
+    res.json({ success: true });
+});
+
+app.post('/bot/clear', async (req, res) => {
+    const doc = await UserModel.findOne({ id: req.session.userId });
+    const user = doc.toObject(); // FIX
+    user.bot.coins = [];
+    user.bot.active = false;
+    await saveUser(user);
+    res.json({ success: true });
+});
+
+// ⚡⚡⚡ NEW ENDPOINT: MANUAL DCA EXECUTION ⚡⚡⚡
+app.post('/bot/manual-dca', async (req, res) => {
+    try {
+        const user = await UserModel.findOne({ id: req.session.userId });
+        const symbol = req.body.symbol;
+        const client = getUserClient(user);
+        await client.ensureMarkets();
+
+        // 1. Get Position
+        const positions = await client.fetchPositions([symbol]);
+        const pos = positions.find(p => p.symbol === symbol);
+        if (!pos || parseFloat(pos.contracts) === 0) return res.json({ success: false, message: 'No position found' });
+
+        // 2. Get Market Rules (Min Qty / Step Size)
+        const market = client.market(symbol);
+        const stepSize = (market.limits && market.limits.amount && market.limits.amount.min) ? market.limits.amount.min : 0.001;
+
+        // 3. Calculate Qty
+        const size = parseFloat(pos.contracts);
+        const entryPrice = parseFloat(pos.entryPrice);
+        const leverage = parseFloat(pos.leverage || 10);
+        const ticker = GLOBAL_TICKERS[symbol] || await client.fetchTicker(symbol);
+
+        // Use Bid/Ask
+        const pnlCalc = calculatePositionPNL(pos, ticker, user.mode);
+        const currentPrice = pnlCalc.exitPrice;
+
+        const recoveryRoi = parseFloat(user.bot.recoveryRoi || -5);
+        const targetRoiDec = recoveryRoi / 100;
+        let targetAvgPrice = 0;
+
+        if (pos.side === 'long') targetAvgPrice = currentPrice / (1 + (targetRoiDec / leverage));
+        else targetAvgPrice = currentPrice / (1 - (targetRoiDec / leverage));
+
+        const priceDiffEntry = Math.abs(entryPrice - targetAvgPrice);
+        const priceDiffCurrent = Math.abs(targetAvgPrice - currentPrice);
+
+        let qtyNeeded = 0;
+        if (priceDiffCurrent > 0.00000001) {
+            qtyNeeded = (size * priceDiffEntry) / priceDiffCurrent;
+        }
+
+        // 4. Rounding Logic (Round to closest min tradable qty)
+        if (qtyNeeded < stepSize) qtyNeeded = stepSize;
+        let finalQty = roundToStep(qtyNeeded, stepSize);
+        if (finalQty < stepSize) finalQty = stepSize;
+
+        // 5. Execute
+        await client.setMarginMode('cross', symbol);
+        
+        // ⚡ FIX: MAP 'long'/'short' -> 'buy'/'sell'
+        const tradeSide = pos.side === 'long' ? 'buy' : 'sell';
+        
+        // ⚡ FIX: ENSURE EXACT STRING PRECISION TO PREVENT "VALIDATION ERROR"
+        const precision = stepSize.toString().split('.')[1]?.length || 0;
+        const safeQty = finalQty.toFixed(precision);
+
+        await client.createOrder(symbol, 'market', tradeSide, safeQty);
+
+        // 6. Update DB
+        const currentDbUser = await UserModel.findOne({ id: user.id });
+        const botCoin = currentDbUser.bot.coins.find(c => c.symbol === symbol);
+        if(botCoin) {
+            botCoin.lastAction = Date.now();
+            botCoin.dcaCount = (botCoin.dcaCount || 0) + 1;
+            // Need to save the fresh doc
+            currentDbUser.markModified('bot.coins');
+            await saveUser(currentDbUser);
+        }
+
+        res.json({ success: true, message: `DCA ${safeQty} ${symbol}` });
+
+    } catch (e) {
+        res.json({ success: false, message: e.message });
+    }
+});
+
+// Existing API endpoints (Trade, Close, etc.)
+app.post('/api/trade', async (req, res) => { const user = await UserModel.findOne({ id: req.session.userId }); try { const client = getUserClient(user); await client.ensureMarkets(); await client.setMarginMode('cross', req.body.symbol); const leverage = parseInt(req.body.leverage) || 10; await client.setLeverage(leverage, req.body.symbol); await client.createOrder(req.body.symbol, req.body.type, req.body.side, req.body.amount, req.body.price); await saveUser(user); res.json({ success: true }); } catch (e) { res.json({ success: false, error: e.message }); } });
+app.post('/api/close', async (req, res) => { const user = await UserModel.findOne({ id: req.session.userId }); try { const client = getUserClient(user); await closePosition(client, req.body.symbol); await saveUser(user); res.json({ success: true }); } catch (e) { res.json({ success: false, error: e.message }); } });
+app.post('/api/close-all', async (req, res) => { const user = await UserModel.findOne({ id: req.session.userId }); try { const client = getUserClient(user); if (user.mode === 'real') { const positions = await client.fetchPositions(); for (const pos of positions) { if (parseFloat(pos.contracts) > 0) { await closePosition(client, pos.symbol, pos); } } await client.closeAllPositions(); } else { const positions = await client.fetchPositions(); for(const pos of positions) { try { if(pos.contracts > 0) { const closeSide = pos.side === 'long' ? 'sell' : 'buy'; await client.createOrder(pos.symbol, 'market', closeSide, pos.contracts); } } catch(err) {} } } await saveUser(user); res.json({ success: true }); } catch (e) { res.json({ success: false, error: e.message }); } });
+app.post('/api/set-balance', async (req, res) => { const user = await UserModel.findOne({ id: req.session.userId }); const amt = parseFloat(req.body.amount); if(!isNaN(amt)) { const r = CURRENCIES[user.currency||'USD'].rate; user.virtual.balance = amt / r; await saveUser(user); } res.json({ success: true }); });
+app.post('/api/reset-max-margin', async (req, res) => { const user = await UserModel.findOne({ id: req.session.userId }); if(user.mode==='virtual') user.virtual.maxMarginUsed=0; else if(user.realClient) user.realClient.maxMarginUsed=0; await saveUser(user); res.json({ success: true }); });
+app.post('/api/reset-pnl', async (req, res) => { const user = await UserModel.findOne({ id: req.session.userId }); if(user.mode === 'virtual') { user.virtual.closedTrades = []; user.virtual.trades = []; } else { if (!user.real) user.real = {}; user.real.closedTrades = []; user.real.startBalance = null; } await saveUser(user); res.json({ success: true }); });
+app.get('/api/orders', async (req, res) => { try { const user = await UserModel.findOne({ id: req.session.userId }); const client = getUserClient(user); const orders = await client.fetchOpenOrders(req.query.symbol); res.json(orders.sort((a,b) => a.symbol.localeCompare(b.symbol)).map(o=>({id:o.id, side:o.side, price:o.price, amount:o.amount}))); } catch(e){ res.json([]); } });
+app.get('/api/history', async (req, res) => { try { const user = await UserModel.findOne({ id: req.session.userId }); const client = getUserClient(user); const trades = await client.fetchMyTrades(req.query.symbol); res.json(trades.reverse().map(t=>({timestamp:t.timestamp, side:t.side, price:t.price, amount:t.amount, cost:t.cost}))); } catch(e){ res.json([]); } });
+app.get('/api/closed-positions', async (req, res) => { try { const user = await UserModel.findOne({ id: req.session.userId }); let closed = []; if (user.mode === 'virtual') { closed = user.virtual.closedTrades || []; } else { if (!user.real) user.real = {}; closed = user.real.closedTrades || []; } res.json(closed.slice(0, 50).map(t => ({ timestamp: t.timestamp, symbol: t.symbol.replace('/USDT:USDT', ''), side: t.side, close: t.close, pnl: parseFloat(t.pnl).toFixed(8), roi: parseFloat(t.roi).toFixed(4), volatility: parseFloat(t.volatility || 0).toFixed(4) }))); } catch(e) { res.json([]); } });
+app.get('/api/raw-positions', async (req, res) => { 
+    try { 
+        const user = await UserModel.findOne({ id: req.session.userId }); 
+        const client = getUserClient(user); 
+        const positions = await client.fetchPositions(); 
+        const rate = CURRENCIES[user.currency||'USD'].rate;
+        const processedPositions = await Promise.all(positions.map(async (p) => {
+            const ticker = GLOBAL_TICKERS[p.symbol] || await client.fetchTicker(p.symbol);
+            const pnlCalc = calculatePositionPNL(p, ticker, user.mode);
+            return { symbol: p.symbol, side: p.side, size: p.contracts, pnl: (pnlCalc.pnl * rate).toFixed(10), roi: pnlCalc.roi, leverage: p.leverage, liquidationPrice: p.liquidationPrice, entryPrice: p.entryPrice, currentPrice: pnlCalc.exitPrice };
+        }));
+        // ⚡ SORT ALPHABETICALLY ⚡
+        processedPositions.sort((a, b) => a.symbol.localeCompare(b.symbol));
+        res.json(processedPositions); 
+    } catch(e){ res.json([]); } 
+});
+app.post('/api/cancel', async (req, res) => { try { const user = await UserModel.findOne({ id: req.session.userId }); const client = getUserClient(user); await client.cancelOrder(req.body.id, req.body.symbol); res.json({ success: true }); } catch(e){ res.json({}); } });
+// Note: /api/position is redundant now as /api/realtime-data covers it, but kept for legacy compatibility if needed
+app.get('/api/position', async (req, res) => { res.json({ upnl:'0.00', closedPnl:'0.00', roi:'0.00%', marginUsed:'0.00', marginFree:'0.00', maxMargin:'0.00', balance:'...', estHour:'0.00', estYear:'0.00' }); });
+
+// ==========================================
+// 8. DB CONNECTION & STARTUP (FIXED)
+// ==========================================
+mongoose.connect(MONGO_URI, { 
+    serverSelectionTimeoutMS: 10000, 
+    socketTimeoutMS: 60000, 
+    family: 4, // ⚡ FIX: Force IPv4 to prevent ENOTFOUND on some hosts
+    writeConcern: { w: 'majority', wtimeout: 5000 },
+    autoIndex: true
+})
+    .then(async () => {
+        console.log("✅ CLOUD: Connected to MongoDB Atlas");
+        // NOTE: The previous safety lock (auto-stopping bots) has been removed.
+        // The bot will now resume whatever state it had in the database.
+        dbStatus = "Connected (Direct)";
+        loadAnalytics();
+        server.listen(PORT, () => console.log(`🚀 SYSTEM ONLINE: http://localhost:${PORT}`));
+        runBotLogic(); 
+    })
+    .catch(err => {
+        console.error("❌ STARTUP ERROR: Could not connect to MongoDB.", err.message);
+        dbStatus = "Startup Error: " + err.message;
+        lastDbError = err.message;
+    });
